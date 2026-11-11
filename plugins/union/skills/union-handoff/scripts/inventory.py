@@ -24,9 +24,74 @@ SKIP_DIRS = {
     ".ruff_cache", ".tox", ".next", "dist", "build", "target", ".gradle", ".cache",
 }
 
-# Filenames that hold secrets. An untracked one inside a repo is reported as a
-# credential and left behind unless the user picks it.
-SECRET_FILE_RE = re.compile(r"^(\.env(\..+)?|.*\.pem|.*\.key|credentials(\.json)?|.*secret.*\.(json|ya?ml))$", re.I)
+# Filenames that conventionally hold secrets. Every copy path (untracked files,
+# trees, memory, skills) leaves a match behind unless the user picks it by id.
+SECRET_FILE_RE = re.compile(
+    r"^(\.env(\..+)?|\.envrc|.*\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfstate\.backup|tfvars)"
+    r"|credentials(\.json|\.toml|\.ya?ml)?|.*secrets?.*\.(json|ya?ml|toml|env)|auth\.json|token(s)?\.json"
+    r"|\.netrc|_netrc|\.npmrc|\.pypirc|\.git-credentials|\.dockercfg|kubeconfig.*|\.kube|"
+    r"id_(rsa|dsa|ecdsa|ed25519)(_sk)?|.*service[-_]?account.*\.json|application_default_credentials\.json)$",
+    re.I,
+)
+
+
+def is_secret_file(name: str) -> bool:
+    return bool(SECRET_FILE_RE.match(name)) and not name.endswith(".pub")
+
+
+def file_credential_id(path: Path) -> str:
+    """A credential id that names exactly one file: two repos with the same
+    name can both hold a .env, and picking one must not pick the other."""
+    return f"file:{path}"
+
+
+# Values that look like live credentials, to scan transcripts and patches for.
+# Only the KIND is ever reported, never the match.
+SECRET_VALUE_PATTERNS = [
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "AWS access key id"),
+    (re.compile(r"aws_secret_access_key\s*[=:]\s*\S{20,}", re.I), "AWS secret key"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    (re.compile(r"\bgh[pousr]_[0-9A-Za-z]{30,}"), "GitHub token"),
+    (re.compile(r"\bgithub_pat_[0-9A-Za-z_]{40,}"), "GitHub token"),
+    (re.compile(r"\bglpat-[0-9A-Za-z_-]{20,}"), "GitLab token"),
+    (re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}"), "Slack token"),
+    (re.compile(r"\bsk-(ant-|proj-)?[A-Za-z0-9_-]{32,}"), "API key"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "Google API key"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"), "JWT"),
+]
+
+
+# One alternation instead of a loop over patterns: transcripts reach hundreds
+# of MB, and a single pass is several times faster.
+_SECRET_VALUE_RE = re.compile("|".join(
+    f"(?P<p{i}>{'(?i:' + rx.pattern + ')' if rx.flags & re.I else rx.pattern})"
+    for i, (rx, _) in enumerate(SECRET_VALUE_PATTERNS)
+))
+
+
+def scan_secret_values(lines: Iterable[str]) -> dict[str, int]:
+    """Kinds of credential-looking values in some text, with counts."""
+    found: dict[str, int] = {}
+    for line in lines:
+        for m in _SECRET_VALUE_RE.finditer(line):
+            kind = SECRET_VALUE_PATTERNS[int(m.lastgroup[1:])][1]
+            found[kind] = found.get(kind, 0) + 1
+    return found
+
+
+def redact_values(text: str) -> str:
+    """Text with anything credential-looking replaced by its kind."""
+    for rx, kind in SECRET_VALUE_PATTERNS:
+        text = rx.sub(f"<redacted {kind}>", text)
+    return text
+
+
+_USERINFO_RE = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
+
+
+def redact_url(url: Optional[str]) -> Optional[str]:
+    """A remote URL without any user:password@ part."""
+    return _USERINFO_RE.sub(r"\1", url) if url else url
 
 
 def _git(repo: Path, *args: str, check: bool = False) -> str:
@@ -64,7 +129,11 @@ class Repo:
     patch_bytes: int = 0
     history_bytes: int = 0  # object store on disk: an upper bound for the bundle
     tree_bytes: int = 0  # working tree, without SKIP_DIRS
-    secret_files: list[str] = field(default_factory=list)
+    secret_files: list[str] = field(default_factory=list)  # untracked (or, for a tree, any) secret-looking files
+    tracked_secret_files: list[str] = field(default_factory=list)  # already committed: they travel in history
+    submodules: int = 0
+    worktree: bool = False  # a linked worktree (its .git is a file pointing elsewhere)
+    secrets_in_patch: dict = field(default_factory=dict)
     sessions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -86,37 +155,61 @@ def _dir_bytes(root: Path, skip: set[str] = SKIP_DIRS, limit_files: int = 200_00
     return total
 
 
+def _z(out: bytes) -> list[str]:
+    # fsdecode keeps non-UTF-8 filenames round-trippable (surrogateescape).
+    return [os.fsdecode(f) for f in out.split(b"\0") if f]
+
+
 def untracked(repo: Path) -> list[str]:
-    out = subprocess.run(
-        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"],
-        capture_output=True,
-    ).stdout.decode(errors="replace")
-    return [f for f in out.split("\0") if f]
+    return _z(subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"], capture_output=True,
+    ).stdout)
+
+
+def tree_secret_files(root: Path) -> list[str]:
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames + [d for d in dirnames if is_secret_file(d)]:
+            if is_secret_file(f):
+                out.append(os.path.relpath(os.path.join(dirpath, f), root))
+    return sorted(out)
 
 
 def describe_repo(path: Path) -> Repo:
     top = git_toplevel(path)
     if top is None:
-        return Repo(path=str(path), git=False, tree_bytes=_dir_bytes(path))
+        r = Repo(path=str(path), git=False, tree_bytes=_dir_bytes(path))
+        r.secret_files = tree_secret_files(path)
+        return r
     r = Repo(path=str(top), git=True)
-    r.branch = _git(top, "rev-parse", "--abbrev-ref", "HEAD") or None
-    r.head = _git(top, "rev-parse", "HEAD") or None
-    r.remote = _git(top, "remote", "get-url", "origin") or None
+    r.worktree = (top / ".git").is_file()
+    r.head = _git(top, "rev-parse", "--verify", "--quiet", "HEAD") or None
+    r.branch = (_git(top, "rev-parse", "--abbrev-ref", "HEAD") or None) if r.head else None
+    r.remote = redact_url(_git(top, "remote", "get-url", "origin") or None)
     r.branches = [b for b in _git(top, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines() if b]
     ahead = _git(top, "rev-list", "--count", "@{upstream}..HEAD")
     r.unpushed_commits = int(ahead) if ahead.isdigit() else 0
     status = _git(top, "status", "--porcelain")
     r.modified_files = sum(1 for line in status.splitlines() if line and not line.startswith("??"))
-    files = untracked(top)
-    r.untracked_files = len(files)
-    for f in files:
-        if SECRET_FILE_RE.match(Path(f).name):
+    if not r.head:
+        r.secret_files = tree_secret_files(top)
+        r.tree_bytes = _dir_bytes(top)
+        return r
+    for f in untracked(top):
+        if is_secret_file(Path(f).name):
             r.secret_files.append(f)
+        r.untracked_files += 1
         try:
             r.untracked_bytes += (top / f).lstat().st_size
         except OSError:
             pass
-    r.patch_bytes = len(subprocess.run(["git", "-C", str(top), "diff", "HEAD", "--binary"], capture_output=True).stdout)
+    tracked = _z(subprocess.run(["git", "-C", str(top), "ls-files", "-z"], capture_output=True).stdout)
+    r.tracked_secret_files = [f for f in tracked if is_secret_file(Path(f).name)]
+    r.submodules = sum(1 for line in _git(top, "submodule", "status").splitlines() if line.strip())
+    patch = subprocess.run(["git", "-C", str(top), "diff", "HEAD", "--binary"], capture_output=True).stdout
+    r.patch_bytes = len(patch)
+    r.secrets_in_patch = scan_secret_values(patch.decode(errors="replace").splitlines())
     common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common:
         r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())
@@ -326,6 +419,24 @@ def command_names(command: str) -> list[str]:
     return names
 
 
+def command_dirs(command: str) -> list[str]:
+    """Directories a shell command line moves into or points git at
+    (``cd DIR``, ``pushd DIR``, ``git -C DIR``): repos a session worked in
+    through its shell rather than its file tools."""
+    dirs = []
+    for segment in split_segments(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            continue
+        for i, w in enumerate(words[:-1]):
+            if (w in ("cd", "pushd") and i == 0) or (w == "-C" and "git" in words[:i]):
+                d = words[i + 1]
+                if d.startswith(("/", "~")):
+                    dirs.append(os.path.expanduser(d))
+    return dirs
+
+
 @dataclass
 class Tool:
     name: str
@@ -488,7 +599,8 @@ def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = No
             found.append(Credential(cid, kind, str(p), rel, "never copied; the Union agent signs in on its own", copyable=False))
     for repo in repos:
         for f in repo.secret_files:
-            found.append(Credential(f"repo:{Path(repo.path).name}/{f}", "untracked secret file in a repo",
-                                    str(Path(repo.path) / f), None, "use a project secret, or copy it if the repo needs it"))
+            p = Path(repo.path) / f
+            found.append(Credential(file_credential_id(p), "secret-looking file in a repo (not committed)",
+                                    str(p), None, "use a project secret, or copy it if the repo needs it"))
     names = sorted(k for k in (env or os.environ) if FLAGGED_ENV_NAME_RE.search(k))
     return found, names

@@ -28,7 +28,7 @@ checks:
   # Credentials by id, the agent login never copyable, env vars by name only.
   - {kind: json_contains, path: "credentials[*].id", item: gh}
   - {kind: json_contains, path: "credentials[*].id", item: aws}
-  - {kind: json_contains, path: "credentials[*].id", item: "repo:webapp/.env"}
+  - {kind: json_contains, path: "credentials[*].id", item: "file:{webapp}/.env"}
   - {kind: json_contains, path: "credentials[*].id", item: claude-login}
   - {kind: json_contains, path: "flagged_env_names", item: MY_SERVICE_API_KEY}
   # How each session would arrive with the default remote harness.
@@ -36,4 +36,6 @@ checks:
   - {kind: json_equals, path: "sessions[1].arrives", equals: resumable}
   - {kind: json_equals, path: "sessions[2].arrives", equals: handoff note}
   - {kind: json_equals, path: "sessions[2].remote_harness", equals: claude}
-  - {kind: json_min, path: "totals.total_bytes_upper_bound", min: 1}
+  - {kind: json_min, path: "totals.total_bytes_estimate", min: 1}
+  # Every session is scanned for credential-looking values; the fixture has none.
+  - {kind: json_equals, path: "sessions[0].secrets_in_transcript", equals: {}}

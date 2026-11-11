@@ -85,37 +85,89 @@ def local_name(opts: SealOptions) -> str:
     return opts.volume or ""
 
 
-FAILED_COPY = """The copy into the volume failed: {error}
+FAILED_COPY = """The copy into the volume did not finish: {error}
 
-The mount is still held, unpublished, so nothing half-copied was sealed:
+The mount is still up and nothing has been published yet:
   pid {pid}, mounted at {mnt}, local name {name}
 
-Either finish it: fix the cause, copy the rest of {home} into {mnt}, then
+Ctrl-C, `kill` and `flyte unmount volume` all PUBLISH whatever is in the
+mount, so do not stop it that way until it is complete. Either finish it:
+copy the rest of {home} into {mnt}, then
   kill -INT {pid}            # publishes, like Ctrl-C
-or throw it away:
+or throw it away. SIGKILL is the one stop that does not publish:
   kill -KILL {pid}
   flyte forget volume {name} --discard
-(forget refuses while the mount's client process still holds it, and names
-that process; stop it and run forget again.)
+(forget refuses while the mount's client process still holds the volume, and
+names that process; stop that one too, then run forget again.)
 """
 
 
+class Collision(Exception):
+    pass
+
+
+def _units(home: Path) -> list[str]:
+    """The pieces of a staged home that must land whole or not at all: each
+    repo, each written handoff, each transcript and its sidecar, each Codex
+    session home. A merge that met any of them half-present would build a
+    hybrid (say, one repo's objects under another's HEAD)."""
+    units = []
+    for parent in ("src", "handoff", ".agent-sessions/codex/sessions"):
+        d = home / parent
+        if d.is_dir():
+            units += [f"{parent}/{c.name}" for c in sorted(d.iterdir())]
+    projects = home / ".claude" / "projects"
+    if projects.is_dir():
+        for proj in sorted(projects.iterdir()):
+            for c in sorted(proj.iterdir()):
+                if c.name != "memory":
+                    units.append(f".claude/projects/{proj.name}/{c.name}")
+    return units
+
+
+def _no_symlinks_below(root: Path, rel: str) -> None:
+    """Refuse a destination path that goes through a symlink: following one
+    would write outside the volume."""
+    cur = root
+    for part in Path(rel).parts[:-1]:
+        cur = cur / part
+        if cur.is_symlink():
+            raise Collision(f"{cur} is a symlink in the target home; refusing to write through it")
+
+
+def collisions(home: Path, dest: Path) -> list[str]:
+    hits = [u for u in _units(home) if os.path.lexists(dest / u)]
+    for u in _units(home):
+        try:
+            _no_symlinks_below(dest, u + "/x")
+        except Collision as e:
+            hits.append(str(e))
+    return hits
+
+
 def copy_into(src: Path, dest: Path, merge: bool) -> dict:
-    """Copy the staged home into the mounted volume."""
+    """Copy the staged home into the mounted volume. When merging, nothing in
+    the target is overwritten and no write goes through a symlink."""
     copied, skipped, merged = 0, [], []
     for f in sorted(src.rglob("*")):
         rel = f.relative_to(src).as_posix()
         out = dest / rel
+        _no_symlinks_below(dest, rel)
         if f.is_dir() and not f.is_symlink():
+            if out.is_symlink():
+                raise Collision(f"{out} is a symlink in the target home; refusing to write through it")
             out.mkdir(parents=True, exist_ok=True)
             continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        if merge and out.exists():
-            if rel in MERGED_FILES:
+        if merge and os.path.lexists(out):
+            if out.is_symlink():
+                skipped.append(rel)
+            elif rel in MERGED_FILES:
                 existing = json.loads(out.read_text() or "{}")
                 ours = json.loads(f.read_text())
-                out.write_text(json.dumps(stg.merge_finished(existing, ours.get("sessions", [])), indent=1) + "\n")
+                result, dup = stg.merge_finished(existing, ours.get("sessions", []))
+                out.write_text(json.dumps(result, indent=1) + "\n")
                 merged.append(rel)
+                skipped += [f"{rel}#{k}" for k in dup]
             elif rel in APPENDED_FILES:
                 stg._append_section(out, stg.HANDOFF_POINTER)
                 merged.append(rel)
@@ -123,8 +175,6 @@ def copy_into(src: Path, dest: Path, merge: bool) -> dict:
                 skipped.append(rel)
             continue
         if f.is_symlink():
-            if out.is_symlink() or out.exists():
-                out.unlink()
             os.symlink(os.readlink(f), out)
         else:
             shutil.copy2(f, out)
@@ -159,7 +209,9 @@ def seal(opts: SealOptions) -> dict:
     mnt.mkdir(parents=True, exist_ok=True)
     print(f"$ {shlex.join(cmd)}", file=sys.stderr)
     log = tempfile.NamedTemporaryFile("w+", prefix="union-handoff-flyte-", suffix=".log", delete=False)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
+    # Its own session: a Ctrl-C in this terminal must not reach the mount,
+    # because a mount that receives one publishes whatever it holds.
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     result: dict = {"command": shlex.join(cmd), "mountpoint": str(mnt), "log": log.name}
     try:
         _wait_mounted(proc, mnt, opts.mount_timeout)
@@ -167,10 +219,22 @@ def seal(opts: SealOptions) -> dict:
         log.seek(0)
         tail = "\n".join(log.read().splitlines()[-25:])
         raise SystemExit(f"{e}. The end of its output ({log.name}):\n{tail}")
+    if opts.merge_artifact:
+        hits = collisions(home, mnt)
+        if hits:
+            # Nothing was written, so stopping now publishes an unchanged fork.
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=opts.publish_timeout)
+            raise SystemExit(
+                "The target home already has parts of this handoff, so merging would mix two copies:\n  "
+                + "\n  ".join(hits)
+                + "\nNothing was copied. Re-stage with --exclude for those repos, or hand off into a new agent."
+            )
     try:
         result.update(copy_into(home, mnt, merge=bool(opts.merge_artifact)))
-    except Exception as e:
-        raise SystemExit(FAILED_COPY.format(error=e, pid=proc.pid, mnt=mnt, name=local_name(opts), home=home))
+    except (Exception, KeyboardInterrupt) as e:
+        raise SystemExit(FAILED_COPY.format(error=str(e) or type(e).__name__, pid=proc.pid, mnt=mnt,
+                                            name=local_name(opts), home=home))
     proc.send_signal(signal.SIGINT)
     try:
         proc.wait(timeout=opts.publish_timeout)

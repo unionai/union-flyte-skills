@@ -57,18 +57,28 @@ Show the user the whole report, in your own words where it helps. It covers:
   **uncommitted work** (staged and unstaged changes, untracked files). A
   directory that is not a git repo travels as a **full tree**, without
   `node_modules`, virtualenvs and build output. Offer `--tree <repo>` for a git
-  repo the user wants copied as-is, and `--exclude <repo>` to leave one behind.
-- **Transcripts** and their sizes, and a **total**. Repo sizes are upper
-  bounds (the whole object store).
+  repo the user wants copied as-is, `--exclude <repo>` to leave one behind, and
+  `--include <dir>` for a repo the sessions used that the report missed (the
+  script finds repos from working directories, file tools and `cd`/`git -C` in
+  shell commands, but a script can reach a repo in ways it cannot see). Pass
+  the same flags to `report` again to see the result.
+- **Transcripts** and their sizes, and an estimated **total**.
 - **Tools** the sessions ran, counted from their shell commands, with how each
   was installed locally (brew, npm, pip/uv, cargo) and the Linux line that
   installs it in the agent. **Binaries are never copied**: a macOS binary does
   not run on Linux. A setup script installs Linux builds on first boot.
 - **Credentials** found: GitHub CLI, git credential files, SSH keys, cloud CLI
   logins (AWS, Google Cloud, Azure), kubeconfigs, registry and package tokens,
-  untracked secret files such as `.env` in a repo, and the names (never the
-  values) of secret-looking environment variables. The report never prints a
-  credential's value.
+  secret-looking files such as `.env`, `.npmrc` or `id_ed25519` in a repo, and
+  the names (never the values) of secret-looking environment variables. The
+  report never prints a credential's value.
+- **Credentials inside what would be copied.** A transcript is copied whole,
+  so a token the user pasted or a session printed travels with it; the report
+  flags each transcript that holds credential-looking values, and the
+  uncommitted changes too. Files that look like secrets and are already
+  **committed** travel in the git history, and so does a secret committed and
+  later deleted, which the report cannot see. Say so plainly; the fix is to
+  rotate the secret, or leave that session or repo out.
 
 For **each** credential, ask whether to copy it. Say plainly:
 
@@ -76,9 +86,14 @@ For **each** credential, ask whether to copy it. Say plainly:
 > agent, or mount its volume, can read it. The alternative is to sign in again
 > inside the agent, or to give it a project secret.
 
-The default is not to copy. Never offer the Claude or Codex login itself: the
+The default is not to copy. Pick one with `--credential <id>` at the stage
+step, using the id from the report (a file inside a repo has an id like
+`file:/path/to/repo/.env`). Never offer the Claude or Codex login itself: the
 agent signs in on its own. Environment variables cannot be copied; suggest
 project secrets for them.
+
+`stage` refuses to copy a transcript that holds credential-looking values
+until the user has seen that and said to go ahead (`--allow-transcript-secrets`).
 
 ## 4. Ask which harness the agent runs
 
@@ -100,7 +115,9 @@ Re-run the report with `--remote-harness <choice>` if it changes anything.
 - **New agent** (default): a fresh volume becomes its home.
 - **Merge** into an existing agent's home: its volume is forked, the handoff
   is added, and a new version is sealed. Nothing already there is
-  overwritten; clashes are skipped and listed. Ask for the agent home's
+  overwritten. If the home already has one of the handoff's repos or
+  sessions, `seal` stops before copying anything and lists them; re-stage
+  with `--exclude` for those, or use a new agent. Ask for the agent home's
   artifact name.
 
 ## 6. Stage, review, seal
@@ -121,7 +138,9 @@ Then, before sealing:
    under "Summary" with a short summary of that session from its transcript:
    the goal, what is done, what is in progress, and the next step.
 2. **Review the setup script** at `home/.handoff/setup.sh`. Fill in or delete
-   its `TODO` lines; you know these tools better than the script does.
+   its `TODO` lines; you know these tools better than the script does. It
+   exits non-zero, and does not mark itself done, until every tool it lists
+   is installed.
 3. Tell the user what was staged and where (`home/.handoff/README.md` lists
    it), and ask them to confirm.
 
@@ -142,8 +161,13 @@ python3 scripts/handoff.py seal --staged ~/union-handoff/<name> \
 Add `--dry-run` first to show the exact `flyte` command. `seal` mounts the
 volume, copies the staged home in, and stops the mount, which seals a new,
 immutable version and prints its locator. Pass `--bucket s3://...` to pick the
-storage instead of the project's default. If the copy fails part way, `seal`
-leaves the mount held and unpublished and prints how to finish or discard it.
+storage instead of the project's default.
+
+Stopping a mount in any normal way (Ctrl-C, `kill`, `flyte unmount volume`)
+publishes what is in it. So if the copy fails or is interrupted part way,
+`seal` leaves the mount up and unpublished, and prints how to finish the copy
+and publish, or discard it. Relay that to the user as it is; do not stop the
+mount yourself.
 
 ## 7. Start the agent
 

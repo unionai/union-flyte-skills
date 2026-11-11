@@ -18,11 +18,13 @@ See references/harnesses.md for how each was verified.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,7 @@ class Session:
     size_bytes: int = 0
     # Extra files that belong to the session (sidecar dirs, part files).
     extra: list[Path] = field(default_factory=list)
+    raw_id: Optional[str] = None  # the id as the harness stores it, when safe_id changed it
 
     @property
     def key(self) -> str:
@@ -74,6 +77,23 @@ class Parsed:
     last_user: str = ""
     last_assistant: str = ""
     branch: Optional[str] = None
+    # Every turn in order as (role, text), for harnesses whose transcript lives
+    # in a database, so a written handoff carries the whole conversation.
+    turns: list = field(default_factory=list)
+
+
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def safe_id(candidate, fallback: str) -> str:
+    """A session id that is safe as one path component. Ids come from inside
+    transcripts, which are data, so never trust one as a path."""
+    c = str(candidate or "")
+    return c if _SAFE_ID_RE.match(c) and c not in (".", "..") else fallback
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha1(text.encode(errors="replace")).hexdigest()[:12]
 
 
 def home() -> Path:
@@ -91,10 +111,15 @@ def _iso(ts) -> Optional[float]:
         return None
 
 
+class MissingDecompressor(RuntimeError):
+    pass
+
+
 def _read_lines(path: Path) -> Iterator[str]:
+    """A transcript's lines, streamed. Codex rewrites rollouts older than a
+    week as zstd: Python 3.14 reads that natively, older Pythons need the zstd
+    CLI. A missing or failing decompressor raises rather than reading as empty."""
     if path.suffix == ".zst":
-        # Codex rewrites rollouts older than a week as zstd. Python 3.14 reads
-        # it natively; otherwise the zstd CLI does.
         try:
             from compression import zstd  # type: ignore[import-not-found]
 
@@ -103,17 +128,34 @@ def _read_lines(path: Path) -> Iterator[str]:
             return
         except ImportError:
             pass
-        proc = subprocess.run(["zstd", "-dc", str(path)], capture_output=True)
-        if proc.returncode == 0:
-            yield from proc.stdout.decode(errors="replace").splitlines()
+        try:
+            proc = subprocess.Popen(["zstd", "-dc", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            raise MissingDecompressor(f"{path} is zstd-compressed; install zstd (or use Python 3.14+) to read it")
+        assert proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                yield raw.decode(errors="replace")
+        finally:
+            proc.stdout.close()
+            err = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+            code = proc.wait()
+        if code != 0:
+            raise RuntimeError(f"zstd could not read {path}: {err.strip()}")
         return
     with path.open(errors="replace") as fh:
         yield from fh
 
 
+def iter_text_lines(path: Path) -> Iterator[str]:
+    """Lines of a transcript, each ending in a newline, streamed."""
+    for line in _read_lines(path):
+        yield line if line.endswith("\n") else line + "\n"
+
+
 def read_text(path: Path) -> str:
     """A transcript's full text, decompressed if need be."""
-    return "".join(line if line.endswith("\n") else line + "\n" for line in _read_lines(path))
+    return "".join(iter_text_lines(path))
 
 
 def _jsonl(path: Path, max_bytes: Optional[int] = None) -> Iterator[dict]:
@@ -124,7 +166,7 @@ def _jsonl(path: Path, max_bytes: Optional[int] = None) -> Iterator[dict]:
         for line in _read_lines(path):
             seen += len(line)
             if max_bytes is not None and seen > max_bytes:
-                return
+                return  # closing the generator stops a zstd child early
             line = line.strip()
             if not line:
                 continue
@@ -136,6 +178,10 @@ def _jsonl(path: Path, max_bytes: Optional[int] = None) -> Iterator[dict]:
                 yield rec
     except OSError:
         return
+    except MissingDecompressor as e:
+        if max_bytes is None:
+            raise
+        print(f"warning: {e}", file=sys.stderr)
 
 
 def _text(content) -> str:
@@ -225,30 +271,35 @@ def claude_sessions() -> list[Session]:
 def claude_parse(s: Session) -> Parsed:
     p = Parsed()
     users = []
-    for rec in _jsonl(s.path):
-        if rec.get("cwd") and rec["cwd"] not in p.cwds:
-            p.cwds.append(rec["cwd"])
-        if rec.get("gitBranch"):
-            p.branch = rec["gitBranch"]
-        msg = rec.get("message") or {}
-        content = msg.get("content")
-        if rec.get("type") == "user" and not rec.get("isMeta"):
-            t = _text(content)
-            if not _is_noise(t):
-                users.append(t)
-        if rec.get("type") == "assistant":
-            t = _text(content)
-            if t:
-                p.last_assistant = t
-            for block in content if isinstance(content, list) else []:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                inp = block.get("input") or {}
-                if block.get("name") == "Bash" and inp.get("command"):
-                    p.commands.append(str(inp["command"]))
-                for k in ("file_path", "notebook_path", "path"):
-                    if isinstance(inp.get(k), str):
-                        p.paths.append(inp[k])
+    # Sub-agent transcripts ride in the sidecar directory; their tool calls
+    # count toward the repos and tools, their messages do not.
+    sidecars = [f for d in s.extra for f in sorted(d.rglob("*.jsonl"))]
+    for path in [s.path] + sidecars:
+        main = path == s.path
+        for rec in _jsonl(path):
+            if main and rec.get("cwd") and rec["cwd"] not in p.cwds:
+                p.cwds.append(rec["cwd"])
+            if main and rec.get("gitBranch"):
+                p.branch = rec["gitBranch"]
+            msg = rec.get("message") or {}
+            content = msg.get("content")
+            if main and rec.get("type") == "user" and not rec.get("isMeta"):
+                t = _text(content)
+                if not _is_noise(t):
+                    users.append(t)
+            if rec.get("type") == "assistant":
+                t = _text(content)
+                if t and main:
+                    p.last_assistant = t
+                for block in content if isinstance(content, list) else []:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    inp = block.get("input") or {}
+                    if block.get("name") == "Bash" and inp.get("command"):
+                        p.commands.append(str(inp["command"]))
+                    for k in ("file_path", "notebook_path", "path"):
+                        if isinstance(inp.get(k), str):
+                            p.paths.append(inp[k])
     if users:
         p.first_user, p.last_user = users[0], users[-1]
     return p
@@ -265,6 +316,7 @@ def codex_root() -> Path:
 
 _ROLLOUT_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[^.]*)?\.jsonl(?:\.zst)?$")
 _JS_CMD_RE = re.compile(r'\bcmd\s*:\s*("(?:[^"\\]|\\.)*")')
+_JS_WORKDIR_RE = re.compile(r'\bworkdir\s*:\s*("(?:[^"\\]|\\.)*")')
 
 
 def codex_sessions() -> list[Session]:
@@ -287,7 +339,7 @@ def codex_sessions() -> list[Session]:
             if meta is not None and title:
                 break
         m = _ROLLOUT_ID_RE.search(f.name)
-        sid = (meta or {}).get("id") or (m.group(1) if m else f.stem)
+        sid = safe_id((meta or {}).get("id"), m.group(1) if m else safe_id(f.stem, "codex-session"))
         st = f.stat()
         out.append(Session("codex", sid, f, (meta or {}).get("cwd"), title, _iso((meta or {}).get("timestamp")), st.st_mtime, st.st_size))
     return out
@@ -356,6 +408,12 @@ def codex_parse(s: Session) -> Parsed:
             if payload.get("type") == "message" and payload.get("role") == "assistant":
                 p.last_assistant = _text(payload.get("content")) or p.last_assistant
             p.commands.extend(codex_commands(payload))
+            if payload.get("type") == "custom_tool_call":
+                for lit in _JS_WORKDIR_RE.findall(str(payload.get("input") or "")):
+                    try:
+                        p.paths.append(json.loads(lit))
+                    except ValueError:
+                        pass
             if payload.get("type") == "function_call":
                 try:
                     wd = json.loads(payload.get("arguments") or "{}").get("workdir")
@@ -398,7 +456,7 @@ def pi_sessions() -> list[Session]:
         if header is None:
             continue
         st = f.stat()
-        out.append(Session("pi", str(header.get("id") or f.stem), f, header.get("cwd"), title, _iso(header.get("timestamp")), st.st_mtime, st.st_size))
+        out.append(Session("pi", safe_id(header.get("id"), safe_id(f.stem, "pi-session")), f, header.get("cwd"), title, _iso(header.get("timestamp")), st.st_mtime, st.st_size))
     return out
 
 
@@ -451,7 +509,7 @@ def opencode_sessions() -> list[Session]:
                 info = json.loads(f.read_text())
             except (OSError, ValueError):
                 continue
-            sid = info.get("id") or f.stem
+            sid = safe_id(info.get("id"), safe_id(f.stem, "opencode-session"))
             if info.get("parentID"):
                 continue  # a sub-agent's session; it travels with its parent
             msg_dir = root / "storage" / "message" / sid
@@ -510,8 +568,9 @@ def _opencode_db_sessions(db: Path) -> list[Session]:
         get = lambda k: r[k] if k in r.keys() else None  # noqa: E731
         if get("parent_id"):
             continue
-        out.append(Session("opencode", str(get("id")), db, get("directory"), str(get("title") or ""),
-                           _iso(get("time_created")), _iso(get("time_updated")), size))
+        raw = str(get("id"))
+        out.append(Session("opencode", safe_id(raw, "opencode-" + _digest(raw)), db, get("directory"), str(get("title") or ""),
+                           _iso(get("time_created")), _iso(get("time_updated")), size, raw_id=raw))
     return out
 
 
@@ -546,7 +605,7 @@ def opencode_parse(s: Session) -> Parsed:
     p = Parsed(cwds=[s.cwd] if s.cwd else [])
     if s.path.suffix == ".db":
         messages = []  # [(role, [parts])], grouped by consecutive role
-        for role, part in _opencode_db_parts(s.path, s.id):
+        for role, part in _opencode_db_parts(s.path, s.raw_id or s.id):
             if not messages or messages[-1][0] != role:
                 messages.append((role, []))
             messages[-1][1].append(part)
@@ -582,6 +641,10 @@ def opencode_parse(s: Session) -> Parsed:
                     if isinstance(inp.get(k), str):
                         p.paths.append(inp[k])
         text = "\n".join(texts)
+        calls = [f"$ {(part.get('state') or {}).get('input', {}).get('command')}" for part in parts
+                 if part.get("type") == "tool" and part.get("tool") == "bash"]
+        if text or calls:
+            p.turns.append((role, "\n".join([text] + calls).strip()))
         if role == "user" and text:
             users.append(text)
         elif role == "assistant" and text:
@@ -618,9 +681,10 @@ def hermes_sessions() -> list[Session]:
         get = lambda k: r[k] if k in keys else None  # noqa: E731
         if get("parent_session_id"):
             continue
+        raw = str(get("id"))
         out.append(Session(
-            "hermes", str(get("id")), db, get("cwd"), str(get("title") or ""),
-            _iso(get("started_at")), _iso(get("ended_at")) or _iso(get("started_at")), size,
+            "hermes", safe_id(raw, "hermes-" + _digest(raw)), db, get("cwd"), str(get("title") or ""),
+            _iso(get("started_at")), _iso(get("ended_at")) or _iso(get("started_at")), size, raw_id=raw,
         ))
     return out
 
@@ -630,7 +694,7 @@ def hermes_parse(s: Session) -> Parsed:
     try:
         con = sqlite3.connect(f"file:{s.path}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
-        rows = con.execute("select * from messages where session_id = ? order by id", (s.id,)).fetchall()
+        rows = con.execute("select * from messages where session_id = ? order by id", (s.raw_id or s.id,)).fetchall()
         con.close()
     except sqlite3.Error:
         return p
@@ -639,6 +703,8 @@ def hermes_parse(s: Session) -> Parsed:
         keys = r.keys()
         role = r["role"] if "role" in keys else None
         content = r["content"] if "content" in keys else None
+        if content:
+            p.turns.append((str(role), str(content)))
         if role == "user" and content:
             users.append(str(content))
         elif role == "assistant" and content:
@@ -657,6 +723,7 @@ def hermes_parse(s: Session) -> Parsed:
                     args = {}
                 if fn.get("name") == "terminal" and args.get("command"):
                     p.commands.append(str(args["command"]))
+                    p.turns.append((str(role), f"$ {args['command']}"))
                 if isinstance(args.get("path"), str):
                     p.paths.append(args["path"])
     if users:
@@ -727,9 +794,12 @@ def discover(harnesses: Optional[Iterable[str]] = None) -> list[Session]:
 
 
 def parse(s: Session) -> Parsed:
-    if s.harness == "other":
-        return other_parse(s)
-    return READERS[s.harness][1](s)
+    import inventory  # local import: inventory has no harness knowledge
+
+    p = other_parse(s) if s.harness == "other" else READERS[s.harness][1](s)
+    for c in p.commands:
+        p.paths.extend(inventory.command_dirs(c))
+    return p
 
 
 def find(key: str, sessions: Optional[list[Session]] = None) -> Session:

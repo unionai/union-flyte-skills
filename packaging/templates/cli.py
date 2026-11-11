@@ -75,6 +75,12 @@ def target_choices() -> list[str]:
     return sorted(set(TARGETS) | set(ALIASES))
 
 
+# Written into every skill this CLI installs. `uninstall` removes only
+# directories that carry it, so a skill of the same name that the user wrote
+# or customised (and `install` skipped) is never deleted.
+MARKER = ".installed-by-union-flyte-skills"
+
+
 def skill_dirs() -> list[Path]:
     return sorted(
         p for p in (plugin_root() / "skills").iterdir() if (p / "SKILL.md").is_file()
@@ -150,6 +156,7 @@ def cmd_install(args) -> int:
                 else:
                     out.unlink()
             shutil.copytree(src, out)
+            (out / MARKER).write_text("Installed by union-flyte-skills; `uninstall` removes this directory.\n")
             print(f"  install {src.name}")
     if args.dry_run:
         print("\nDry run: nothing was written.")
@@ -167,6 +174,9 @@ def cmd_uninstall(args) -> int:
         for name in sorted(names):
             out = dest / name
             if not (out.exists() or out.is_symlink()):
+                continue
+            if not (out / MARKER).is_file() and not args.force:
+                print(f"  keep {name} (not installed by this tool; use --force to remove it anyway)")
                 continue
             if args.dry_run:
                 print(f"  remove {name}")
@@ -241,6 +251,7 @@ def build_parser(prog: str) -> argparse.ArgumentParser:
 
     p = sub.add_parser("uninstall", help="Remove previously installed skills.")
     _add_target_flags(p)
+    p.add_argument("--force", action="store_true", help="Also remove same-named skills this tool did not install.")
     p.set_defaults(func=cmd_uninstall)
 
     p = sub.add_parser("list", help="List the bundled skills.")

@@ -22,6 +22,7 @@ Layout written under ``<out>/home`` (paths are relative to the agent's home):
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -36,10 +37,10 @@ from typing import Callable, Optional
 import harnesses as hz
 import inventory as inv
 
-# Fields that hold a working directory in the transcripts we re-key. Only these
-# are rewritten: message text, tool output and thinking blocks are left byte for
-# byte, because some of them are signed and a changed byte fails the resume.
-CWD_KEYS = {"cwd", "workspace_roots", "workdir"}
+# Only the metadata fields that record a session's working directory are
+# rewritten (see rewrite_cwds). Message text, tool input and output, and
+# thinking blocks are left byte for byte: some are signed, and a changed byte
+# fails the resume.
 
 
 # --------------------------------------------------------------------------- #
@@ -70,44 +71,59 @@ class PathMap:
         return dict(self.pairs)
 
 
-def rewrite_cwds(obj, pm: PathMap):
-    """Rewrite every CWD_KEYS value in a JSON value, recursively."""
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if k in CWD_KEYS and isinstance(v, str):
-                out[k] = pm.map(v)
-            elif k in CWD_KEYS and isinstance(v, list):
-                out[k] = [pm.map(x) if isinstance(x, str) else x for x in v]
-            else:
-                out[k] = rewrite_cwds(v, pm)
+def rewrite_cwds(rec: dict, pm: PathMap) -> dict:
+    """Rewrite the working-directory metadata of one transcript record.
+
+    Claude Code: the top-level ``cwd`` every record carries.
+    Codex: ``payload.cwd`` and ``payload.workspace_roots`` (session_meta,
+    turn_context), ``payload.thread_settings.cwd``, and the per-environment
+    ``cwd`` in a world_state snapshot. Nothing nested inside messages or tool
+    calls is touched, even when it has a key named cwd.
+    """
+    out = copy.deepcopy(rec)
+    if isinstance(out.get("cwd"), str):
+        out["cwd"] = pm.map(out["cwd"])
+    payload = out.get("payload")
+    if not isinstance(payload, dict) or out.get("type") not in ("session_meta", "turn_context", "world_state", "event_msg"):
         return out
-    if isinstance(obj, list):
-        return [rewrite_cwds(x, pm) for x in obj]
-    return obj
+    if out["type"] in ("session_meta", "turn_context"):
+        if isinstance(payload.get("cwd"), str):
+            payload["cwd"] = pm.map(payload["cwd"])
+        if isinstance(payload.get("workspace_roots"), list):
+            payload["workspace_roots"] = [pm.map(x) if isinstance(x, str) else x for x in payload["workspace_roots"]]
+    settings = payload.get("thread_settings")
+    if isinstance(settings, dict) and isinstance(settings.get("cwd"), str):
+        settings["cwd"] = pm.map(settings["cwd"])
+    envs = ((payload.get("state") or {}).get("environments") or {}).get("environments") if out["type"] == "world_state" else None
+    if isinstance(envs, dict):
+        for env in envs.values():
+            if isinstance(env, dict) and isinstance(env.get("cwd"), str):
+                env["cwd"] = pm.map(env["cwd"])
+    return out
 
 
 def rewrite_jsonl(src: Path, dest: Path, pm: PathMap) -> int:
-    """Copy a JSONL transcript, re-keying its cwd fields. Lines that are not
-    JSON objects are copied unchanged. Returns the number of lines changed."""
+    """Copy a JSONL transcript, streamed, re-keying its cwd metadata. Lines
+    that are not JSON objects, or need no change, are copied byte for byte.
+    Returns the number of lines changed."""
     changed = 0
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("w") as out:
-        for line in hz.read_text(src).splitlines(keepends=True):
+        for line in hz.iter_text_lines(src):
             stripped = line.strip()
             try:
                 rec = json.loads(stripped) if stripped else None
             except ValueError:
                 rec = None
             if not isinstance(rec, dict):
-                out.write(line if line.endswith("\n") else line + "\n")
+                out.write(line)
                 continue
             new = rewrite_cwds(rec, pm)
             if new != rec:
                 changed += 1
                 out.write(json.dumps(new, ensure_ascii=False, separators=(",", ":")) + "\n")
             else:
-                out.write(line if line.endswith("\n") else line + "\n")
+                out.write(line)
     return changed
 
 
@@ -128,16 +144,19 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return proc
 
 
-def stage_git_repo(src: Path, dest: Path, work: Path, include_secret_files: set[str]) -> dict:
+def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) -> dict:
     """Clone ``src`` into ``dest`` through a bundle of its local branches,
     tags and remote-tracking branches (so upstreams and ahead/behind survive),
     then reapply its staged and unstaged changes and copy its untracked
-    files (secret-looking ones only when picked)."""
+    files (secret-looking ones only when picked, by absolute path)."""
     name = dest.name
     bundle = work / f"{name}.bundle"
     bundle.parent.mkdir(parents=True, exist_ok=True)
     _run(["git", "-C", str(src), "bundle", "create", str(bundle), "--branches", "--tags", "--remotes", "HEAD"])
     _run(["git", "init", "--quiet", str(dest)])
+    # Point HEAD at a branch nobody has, so fetching into refs/heads/* cannot
+    # collide with the checked-out initial branch (main or master).
+    _run(["git", "-C", str(dest), "symbolic-ref", "HEAD", "refs/heads/union-handoff-unborn"])
     _run(["git", "-C", str(dest), "fetch", "--quiet", str(bundle), "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "+refs/remotes/*:refs/remotes/*"])
 
     branch = inv._git(src, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -148,7 +167,8 @@ def stage_git_repo(src: Path, dest: Path, work: Path, include_secret_files: set[
         _run(["git", "-C", str(dest), "checkout", "--quiet", "--detach", head])
 
     for remote in inv._git(src, "remote").splitlines():
-        url = inv._git(src, "remote", "get-url", remote)
+        # Credentials embedded in a URL (https://user:token@host) stay behind.
+        url = inv.redact_url(inv._git(src, "remote", "get-url", remote))
         if url:
             _run(["git", "-C", str(dest), "remote", "add", remote, url])
     for b in inv._git(src, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
@@ -166,15 +186,17 @@ def stage_git_repo(src: Path, dest: Path, work: Path, include_secret_files: set[
 
     copied, skipped = [], []
     for rel in inv.untracked(src):
-        if inv.SECRET_FILE_RE.match(Path(rel).name) and rel not in include_secret_files:
+        s, d = src / rel, dest / rel
+        if inv.is_secret_file(Path(rel).name) and str(s) not in picked_files:
             skipped.append(rel)
             continue
-        s, d = src / rel, dest / rel
         d.parent.mkdir(parents=True, exist_ok=True)
         if s.is_symlink():
             os.symlink(os.readlink(s), d)
         elif s.is_file():
             shutil.copy2(s, d)
+        else:
+            continue
         copied.append(rel)
     bundle_bytes = bundle.stat().st_size
     bundle.unlink()
@@ -189,12 +211,24 @@ def stage_git_repo(src: Path, dest: Path, work: Path, include_secret_files: set[
     }
 
 
-def stage_tree(src: Path, dest: Path) -> dict:
+def stage_tree(src: Path, dest: Path, picked_files: set[str]) -> dict:
+    """Copy a directory as-is, without rebuildable dirs and without
+    secret-looking files that were not picked."""
+    skipped = []
+
     def ignore(d, names):
-        return [n for n in names if n in inv.SKIP_DIRS and n != ".git"]
+        out = []
+        for n in names:
+            full = os.path.join(d, n)
+            if n in inv.SKIP_DIRS and n != ".git":
+                out.append(n)
+            elif inv.is_secret_file(n) and full not in picked_files:
+                out.append(n)
+                skipped.append(os.path.relpath(full, src))
+        return out
 
     shutil.copytree(src, dest, symlinks=True, ignore=ignore)
-    return {"mode": "tree", "bytes": inv._dir_bytes(dest)}
+    return {"mode": "tree", "bytes": inv._dir_bytes(dest), "secret_files_left_behind": sorted(skipped)}
 
 
 # --------------------------------------------------------------------------- #
@@ -316,14 +350,35 @@ def finished_row(st: StagedSession, harness: str, now: float, memory: str, cpu: 
             "shell": False,
         },
         "run": "handoff",
-        "key": f"handoff:{st.name}",
+        # Keyed by where the session came from, so two sessions with the same
+        # title never collide and re-importing one is recognisable.
+        "key": f"handoff:{st.source.harness}:{st.source.id}",
     }
 
 
-def merge_finished(existing: dict, rows: list[dict]) -> dict:
-    keys = {r["key"] for r in rows}
-    kept = [r for r in existing.get("sessions", []) if r.get("key") not in keys]
-    return {**existing, "sessions": kept + rows}
+def merge_finished(existing: dict, rows: list[dict]) -> tuple[dict, list[str]]:
+    """Add ``rows`` to an existing finished list without replacing anything.
+
+    A row whose key is already there (the same session handed off before) is
+    skipped and its key returned. A row whose name is taken by a different
+    session gets a suffix, since names are what the agent lists."""
+    current = list(existing.get("sessions", []))
+    keys = {r.get("key") for r in current}
+    names = {r.get("name") for r in current}
+    skipped = []
+    for row in rows:
+        if row["key"] in keys:
+            skipped.append(row["key"])
+            continue
+        name, n = row["name"], 2
+        while name in names:
+            name, n = f"{row['name']}-{n}", n + 1
+        if name != row["name"]:
+            row = {**row, "name": name, "spec": {**row["spec"], "name": name}}
+        current.append(row)
+        keys.add(row["key"])
+        names.add(name)
+    return {**existing, "sessions": current}, skipped
 
 
 # --------------------------------------------------------------------------- #
@@ -350,11 +405,14 @@ apt_install() {
 brew_install() {
   if have brew; then brew install "$@"; else echo "no Homebrew here; install $* by hand" >&2; fi
 }
+FAILED=""
 need() {  # need <binary> <install command...>
   local bin="$1"; shift
   if have "$bin"; then echo "ok    $bin"; return; fi
   echo "setup $bin: $*"
-  eval "$@" || echo "FAILED $bin" >&2
+  eval "$@"
+  hash -r
+  if ! have "$bin"; then echo "FAILED $bin" >&2; FAILED="$FAILED $bin"; fi
 }
 
 # Files copied from another machine keep that machine's user id, and git
@@ -384,12 +442,63 @@ def setup_script(tools: list[inv.Tool]) -> str:
             lines.append(f"need {t.name} {_shq(line)}   # used {t.count}x, locally from {t.installed_by}")
     if todo:
         lines += ["", "# Could not work these out; fill them in or delete them:"] + todo
-    lines += ["", 'touch "$HOME/.handoff/setup.done"', 'echo "setup finished"', ""]
+    lines += [
+        "",
+        'if [ -n "$FAILED" ]; then',
+        '  echo "setup incomplete, still missing:$FAILED (fix the lines above and run it again)" >&2',
+        "  exit 1",
+        "fi",
+        'touch "$HOME/.handoff/setup.done"',
+        'echo "setup finished"',
+        "",
+    ]
     return "\n".join(lines)
 
 
 def _shq(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+# --------------------------------------------------------------------------- #
+# Credentials
+# --------------------------------------------------------------------------- #
+
+
+def transcript_secrets(s: hz.Session) -> dict[str, int]:
+    """Kinds of credential-looking values in everything copied for a session."""
+    files = [s.path] if s.path.is_file() and s.path.suffix != ".db" else []
+    for extra in s.extra:
+        files += [f for f in extra.rglob("*") if f.is_file()] if extra.is_dir() else [extra]
+    if s.path.is_dir():
+        files += [f for f in s.path.rglob("*") if f.is_file()]
+    found: dict[str, int] = {}
+    for f in files:
+        for kind, n in inv.scan_secret_values(hz.iter_text_lines(f)).items():
+            found[kind] = found.get(kind, 0) + n
+    if s.path.suffix == ".db":
+        text = "\n".join(t for _, t in hz.parse(s).turns)
+        for kind, n in inv.scan_secret_values(text.splitlines()).items():
+            found[kind] = found.get(kind, 0) + n
+    return found
+
+
+def validate_credentials(ids: set[str], repo_paths: list[Path], local_home: Path) -> set[str]:
+    """Check every picked credential id before anything is written, and
+    return the absolute paths of picked files inside repos."""
+    creds, _ = inv.credentials(local_home)
+    by_id = {c.id: c for c in creds}
+    picked: set[str] = set()
+    for cid in ids:
+        if cid.startswith("file:"):
+            p = Path(cid[len("file:"):])
+            if not (p.is_file() and inv.is_secret_file(p.name) and any(t in p.parents for t in repo_paths)):
+                raise SystemExit(f"credential {cid!r} is not a secret-looking file inside a repo being moved")
+            picked.add(str(p))
+            continue
+        c = by_id.get(cid)
+        if c is None or not c.copyable or not c.rel:
+            raise SystemExit(f"credential {cid!r} is unknown or cannot be copied")
+    return picked
 
 
 # --------------------------------------------------------------------------- #
@@ -405,6 +514,8 @@ class StageOptions:
     credentials: set[str] = field(default_factory=set)
     tree_repos: set[str] = field(default_factory=set)
     exclude_repos: set[str] = field(default_factory=set)
+    include_dirs: set[str] = field(default_factory=set)
+    allow_transcript_secrets: bool = False
     memory: str = "2Gi"
     cpu: str = "2"
     log: Callable[[str], None] = print
@@ -412,16 +523,24 @@ class StageOptions:
 
 def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     local_home = hz.home()
-    out = opts.out
+    out = opts.out.resolve()
     if out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} is not empty; stage into a new directory")
-    home = out / "home"
-    work = out / "work"
-    home.mkdir(parents=True)
-    work.mkdir()
     rh = opts.remote_home.rstrip("/")
 
     parsed = {s.key: hz.parse(s) for s in sessions}
+
+    # Refuse before writing anything: credential-looking values in what would
+    # be copied, unless the user has seen the report and said yes.
+    found = {s.key: transcript_secrets(s) for s in sessions}
+    found = {k: v for k, v in found.items() if v}
+    if found and not opts.allow_transcript_secrets:
+        lines = [f"  {k}: " + ", ".join(f"{n} {kind}" for kind, n in v.items()) for k, v in found.items()]
+        raise SystemExit(
+            "These transcripts contain values that look like credentials, and a transcript is copied whole:\n"
+            + "\n".join(lines)
+            + "\nRevoke or rotate them, leave those sessions out, or pass --allow-transcript-secrets."
+        )
 
     # 1. Repos, and where each lands.
     repo_paths: list[Path] = []
@@ -429,6 +548,19 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         for top in inv.repos_for(parsed[s.key].cwds or [s.cwd], parsed[s.key].paths, local_home):
             if top not in repo_paths and str(top) not in opts.exclude_repos:
                 repo_paths.append(top)
+    for d in sorted(opts.include_dirs):
+        top = inv.git_toplevel(Path(d)) or Path(d).resolve()
+        if top not in repo_paths:
+            repo_paths.append(top)
+    for top in repo_paths:
+        if out == top or top in out.parents:
+            raise SystemExit(f"--out {out} is inside {top}, which is being copied; stage somewhere else")
+
+    picked_files = validate_credentials(opts.credentials, repo_paths, local_home)
+    home = out / "home"
+    work = out / "work"
+    home.mkdir(parents=True)
+    work.mkdir()
     pm = PathMap()
     names: set[str] = set()
     remote_of: dict[str, str] = {}
@@ -442,23 +574,23 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         pm.add(str(top), f"{rh}/src/{name}")
     pm.add(str(local_home), rh)
 
-    picked_secret_files: dict[str, set[str]] = {}
-    for cid in opts.credentials:
-        if cid.startswith("repo:"):
-            repo_name, _, rel = cid[len("repo:"):].partition("/")
-            picked_secret_files.setdefault(repo_name, set()).add(rel)
-
     repos: dict[str, dict] = {}
     for top in repo_paths:
         dest = home / remote_of[str(top)][len(rh) + 1:]
         dest.parent.mkdir(parents=True, exist_ok=True)
         is_git = inv.is_git(top)
-        if is_git and inv.has_commits(top) and str(top) not in opts.tree_repos:
+        as_tree = str(top) in opts.tree_repos
+        if as_tree and (top / ".git").is_file():
+            # A linked worktree's .git points at the old machine; a copied tree
+            # would carry a broken repo. Rebuild it from a bundle instead.
+            opts.log(f"note  {top} is a git worktree, so it travels as a bundle, not a tree")
+            as_tree = False
+        if is_git and inv.has_commits(top) and not as_tree:
             opts.log(f"repo  {top} -> {remote_of[str(top)]} (bundle)")
-            info = stage_git_repo(top, dest, work, picked_secret_files.get(top.name, set()))
+            info = stage_git_repo(top, dest, work, picked_files)
         else:
             opts.log(f"repo  {top} -> {remote_of[str(top)]} (tree)")
-            info = stage_tree(top, dest)
+            info = stage_tree(top, dest, picked_files)
         info["remote"] = remote_of[str(top)]
         repos[str(top)] = info
 
@@ -501,8 +633,18 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
                 st.files = [str((d / "transcript.md").relative_to(home))]
             else:
                 tname = "transcript" + (".jsonl" if s.path.name.endswith((".jsonl", ".jsonl.zst")) else s.path.suffix)
-                (d / tname).write_text(hz.read_text(s.path))
+                with (d / tname).open("w") as fh:
+                    fh.writelines(hz.iter_text_lines(s.path))
                 st.files = [str((d / tname).relative_to(home))]
+            for extra in s.extra:  # sub-agent transcripts, message and part files
+                target = d / "extra" / extra.name
+                if extra.is_dir():
+                    shutil.copytree(extra, target, symlinks=True)
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(extra, target)
+            if s.extra:
+                st.files.append(str((d / "extra").relative_to(home)) + "/")
             session_repos = {k: v for k, v in repos.items() if any(
                 c == k or c.startswith(k + "/") for c in (p.cwds or [s.cwd or ""]))}
             tools = inv.tools_from(p.commands, local_home)
@@ -519,12 +661,13 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     by_id = {c.id: c for c in creds}
     copied_creds = []
     for cid in sorted(opts.credentials):
-        if cid.startswith("repo:"):
-            copied_creds.append(cid)  # copied with its repo above
+        if cid.startswith("file:"):
+            src = Path(cid[len("file:"):])
+            top = next(t for t in repo_paths if t in src.parents)
+            if (home / remote_of[str(top)][len(rh) + 1:] / src.relative_to(top)).exists():
+                copied_creds.append(cid)  # copied with its repo above
             continue
-        c = by_id.get(cid)
-        if c is None or not c.copyable or not c.rel:
-            raise SystemExit(f"credential {cid!r} is unknown or cannot be copied")
+        c = by_id[cid]
         src, dest = Path(c.path), home / c.rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
@@ -549,7 +692,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     if rows:
         f = home / ".agent-sessions" / "finished.json"
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(json.dumps(merge_finished({}, rows), indent=1) + "\n")
+        f.write_text(json.dumps(merge_finished({}, rows)[0], indent=1) + "\n")
 
     readme = _readme(staged, repos, pm, copied_creds, opts.remote_harness)
     (hdir / "README.md").write_text(readme)
@@ -567,6 +710,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
             for st in staged
         ],
         "credentials_copied": copied_creds,
+        "transcript_secrets": found,
         "extras": extras,
         "tools": [t.to_dict() for t in tools_all],
     }
@@ -617,20 +761,28 @@ def _readme(staged: list[StagedSession], repos: dict, pm: PathMap, creds: list[s
 
 
 def _db_transcript(s: hz.Session, p: hz.Parsed) -> str:
-    return (
-        f"# {s.harness} session {s.id}\n\n"
-        "The original lives in a database; this is what could be read from it.\n\n"
-        f"## First request\n\n{_quote(p.first_user)}\n\n## Last request\n\n{_quote(p.last_user)}\n\n"
-        f"## Last reply\n\n{_quote(p.last_assistant)}\n\n## Commands\n\n"
-        + "\n".join(f"    {c}" for c in p.commands[:500]) + "\n"
-    )
+    """The whole conversation, in order, from a harness that keeps it in a
+    database: every message and every shell command."""
+    out = [f"# {s.harness} session {s.id}", "", "Exported in order from the harness's database.", ""]
+    for role, text in p.turns:
+        out += [f"## {role}", "", text, ""]
+    return "\n".join(out)
 
 
-def _copy_missing(src: Path, dest: Path) -> int:
-    """Copy a tree without overwriting anything already staged."""
+def _copy_missing(src: Path, dest: Path, skipped: Optional[list] = None) -> int:
+    """Copy a tree without overwriting anything already staged, and without
+    secret-looking files or symlinks that point outside it."""
     n = 0
     for f in src.rglob("*"):
+        if f.is_symlink() and src.resolve() not in f.resolve().parents:
+            if skipped is not None:
+                skipped.append(str(f))
+            continue
         if not f.is_file():
+            continue
+        if inv.is_secret_file(f.name):
+            if skipped is not None:
+                skipped.append(str(f))
             continue
         out = dest / f.relative_to(src)
         if out.exists():
@@ -644,7 +796,7 @@ def _copy_missing(src: Path, dest: Path) -> int:
 def _stage_harness_files(sessions, home: Path, remote: str, rh: str, pm: PathMap, staged) -> dict:
     """Memory, user-level instructions and user-level skills."""
     local_home = hz.home()
-    done: dict[str, list[str]] = {"memory": [], "instructions": [], "skills": []}
+    done: dict[str, list[str]] = {"memory": [], "instructions": [], "skills": [], "left_behind": []}
     harnesses = {s.harness for s in sessions}
 
     # Claude keeps per-project memory beside the transcripts.
@@ -659,7 +811,7 @@ def _stage_harness_files(sessions, home: Path, remote: str, rh: str, pm: PathMap
             dest = home / ".claude" / "projects" / hz.claude_slug(st.remote_cwd) / "memory"
         else:
             dest = home / ".handoff" / "memory" / "claude" / hz.claude_slug(s.cwd)
-        if _copy_missing(mem, dest):
+        if _copy_missing(mem, dest, done["left_behind"]):
             done["memory"].append(str(dest.relative_to(home)))
 
     instructions = {
@@ -700,6 +852,6 @@ def _stage_harness_files(sessions, home: Path, remote: str, rh: str, pm: PathMap
                 dest = target / skill.name
                 if dest.exists():
                     continue
-                shutil.copytree(skill, dest, symlinks=False, ignore=shutil.ignore_patterns("__pycache__"))
-                done["skills"].append(skill.name)
+                if _copy_missing(skill, dest, done["left_behind"]):
+                    done["skills"].append(skill.name)
     return done

@@ -63,7 +63,10 @@ def cmd_discover(args) -> int:
         sessions = [s for s in sessions if s.cwd and os.path.realpath(s.cwd).startswith(want)]
     sessions = sessions[: args.limit]
     if args.json:
-        print(json.dumps([s.to_dict() for s in sessions], indent=1))
+        rows = [s.to_dict() for s in sessions]
+        for r in rows:
+            r["title"] = inv.redact_values(r["title"])
+        print(json.dumps(rows, indent=1))
         return 0
     if not sessions:
         found = [h for h, (lister, _) in hz.READERS.items()]
@@ -75,7 +78,7 @@ def cmd_discover(args) -> int:
     for s in sessions:
         print(f"{s.key[:48]:<48} {hz.fmt_time(s.updated_at):<17} {human(s.size_bytes):>8}  {s.cwd or '-'}")
         if s.title:
-            print(f"{'':<76}{s.title}")
+            print(f"{'':<76}{inv.redact_values(s.title)}")
     return 0
 
 
@@ -89,26 +92,38 @@ def default_remote(local: str) -> str:
     return local if local in hz.REMOTE_HARNESSES else "claude"
 
 
-def build_report(sessions: list[hz.Session], remote_harness: str | None) -> dict:
+def build_report(sessions: list[hz.Session], remote_harness: str | None,
+                 exclude: set[str] = frozenset(), include: set[str] = frozenset()) -> dict:
+    import stage as stg
+
     home = hz.home()
+    big = sum(s.size_bytes for s in sessions)
+    if big > 50 * 1024 * 1024:
+        print(f"Reading and scanning {human(big)} of transcripts; this can take a few minutes.", file=sys.stderr)
     parsed = {s.key: hz.parse(s) for s in sessions}
     repo_map: dict[str, inv.Repo] = {}
     session_rows = []
+    for d in sorted(include):
+        top = inv.git_toplevel(Path(d)) or Path(d).resolve()
+        repo_map[str(top)] = inv.describe_repo(top)
     for s in sessions:
         p = parsed[s.key]
-        tops = inv.repos_for(p.cwds or [s.cwd], p.paths, home)
+        tops = [t for t in inv.repos_for(p.cwds or [s.cwd], p.paths, home) if str(t) not in exclude]
         for top in tops:
             r = repo_map.get(str(top)) or inv.describe_repo(top)
             r.sessions.append(s.key)
             repo_map[str(top)] = r
         target = remote_harness or default_remote(s.harness)
         resumable = s.harness == target
+        row = s.to_dict()
+        row["title"] = inv.redact_values(row["title"])
         session_rows.append({
-            **s.to_dict(),
+            **row,
             "repos": [str(t) for t in tops],
             "commands": len(p.commands),
-            "first_request": hz._short(p.first_user, 200),
-            "last_request": hz._short(p.last_user, 200),
+            "first_request": inv.redact_values(hz._short(p.first_user, 200)),
+            "last_request": inv.redact_values(hz._short(p.last_user, 200)),
+            "secrets_in_transcript": stg.transcript_secrets(s),
             "remote_harness": target,
             "arrives": "resumable" if resumable else "handoff note",
         })
@@ -128,8 +143,8 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None) -> dict
         "flagged_env_names": env_names,
         "totals": {
             "transcript_bytes": transcripts,
-            "repo_bytes_upper_bound": repo_bytes,
-            "total_bytes_upper_bound": transcripts + repo_bytes,
+            "repo_bytes_estimate": repo_bytes,
+            "total_bytes_estimate": transcripts + repo_bytes,
         },
     }
 
@@ -142,6 +157,10 @@ def print_report(rep: dict) -> None:
         if s["title"]:
             print(f"    title: {s['title']}")
         print(f"    shell commands run: {s['commands']}")
+        if s["secrets_in_transcript"]:
+            kinds = ", ".join(f"{n} {k}" for k, n in s["secrets_in_transcript"].items())
+            print(f"    WARNING: the transcript holds credential-looking values ({kinds}).")
+            print("      A transcript is copied whole; rotate them or leave this session out.")
     print("\nREPOS")
     if not rep["repos"]:
         print("  none found (the sessions' working directories are not git repos)")
@@ -158,8 +177,19 @@ def print_report(rep: dict) -> None:
                 print(f"    {r['unpushed_commits']} commit(s) not pushed (they travel in the bundle)")
             if r["secret_files"]:
                 print(f"    secret-looking untracked files, left behind unless picked: {', '.join(r['secret_files'])}")
+            if r["tracked_secret_files"]:
+                print(f"    WARNING: committed files that look like secrets travel in the history: {', '.join(r['tracked_secret_files'])}")
+            if r["secrets_in_patch"]:
+                kinds = ", ".join(f"{n} {k}" for k, n in r["secrets_in_patch"].items())
+                print(f"    WARNING: the uncommitted changes hold credential-looking values ({kinds})")
+            if r["submodules"]:
+                print(f"    {r['submodules']} submodule(s): not followed; the agent re-clones them with `git submodule update --init`")
+            if r["worktree"]:
+                print("    a linked git worktree: it is rebuilt as a standalone repo from the bundle")
         else:
             print(f"  {r['path']}  (not git)  travels as: full tree, {human(r['tree_bytes'])}")
+            if r["secret_files"]:
+                print(f"    secret-looking files, left behind unless picked: {', '.join(r['secret_files'])}")
     print("\nTOOLS the sessions ran (binaries are never copied; a Linux build is installed instead)")
     if not rep["tools"]:
         print("  none beyond the base system")
@@ -178,13 +208,18 @@ def print_report(rep: dict) -> None:
         print("    " + ", ".join(rep["flagged_env_names"]))
     t = rep["totals"]
     print("\nSIZE")
-    print(f"  transcripts {human(t['transcript_bytes'])}; repos up to {human(t['repo_bytes_upper_bound'])};"
-          f" total up to {human(t['total_bytes_upper_bound'])}")
-    print("  (repo sizes are upper bounds: the whole object store, not just the bundled branches)")
+    print(f"  transcripts {human(t['transcript_bytes'])}; repos about {human(t['repo_bytes_estimate'])};"
+          f" total about {human(t['total_bytes_estimate'])}")
+    print("  (an estimate: repo history is the whole object store; skills, memory and the checked-out")
+    print("  files come on top. `stage` prints the exact size.)")
+    print("\nThe report covers credential files and values in transcripts and uncommitted changes.")
+    print("It cannot see a secret committed and later deleted: that stays in the git history.")
 
 
 def cmd_report(args) -> int:
-    rep = build_report(_sessions(args.session), args.remote_harness)
+    rep = build_report(_sessions(args.session), args.remote_harness,
+                       exclude={str(Path(p).expanduser().resolve()) for p in args.exclude or []},
+                       include={str(Path(p).expanduser().resolve()) for p in args.include or []})
     if args.json:
         print(json.dumps(rep, indent=1))
     else:
@@ -208,6 +243,8 @@ def cmd_stage(args) -> int:
         credentials=set(args.credential or []),
         tree_repos={str(Path(p).expanduser().resolve()) for p in args.tree or []},
         exclude_repos={str(Path(p).expanduser().resolve()) for p in args.exclude or []},
+        include_dirs={str(Path(p).expanduser().resolve()) for p in args.include or []},
+        allow_transcript_secrets=args.allow_transcript_secrets,
         log=lambda m: print(m, file=sys.stderr),
     )
     manifest = stg.stage(sessions, opts)
@@ -256,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("report", help="what moving these sessions involves")
     p.add_argument("--session", action="append", required=True, help="harness:id (repeatable)")
     p.add_argument("--remote-harness", choices=hz.REMOTE_HARNESSES, help="default: each session's own harness")
+    p.add_argument("--exclude", action="append", help="leave this repo out")
+    p.add_argument("--include", action="append", help="also move this repo or directory")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_report)
 
@@ -267,6 +306,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--credential", action="append", help="credential id from the report to copy (repeatable)")
     p.add_argument("--tree", action="append", help="copy this repo as a full tree instead of a bundle")
     p.add_argument("--exclude", action="append", help="leave this repo behind")
+    p.add_argument("--include", action="append", help="also move this repo or directory")
+    p.add_argument("--allow-transcript-secrets", action="store_true",
+                   help="stage even though a transcript holds credential-looking values")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_stage)
 

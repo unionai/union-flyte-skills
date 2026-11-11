@@ -123,7 +123,7 @@ def test_report_cli(machine):
     assert {"gh", "kubectl", "helm", "terraform", "uv", "npx"} <= set(tools)
     assert "notacommand" not in tools and "await" not in tools  # heredoc bodies are data
     creds = {c["id"]: c for c in rep["credentials"]}
-    assert {"gh", "aws", "claude-login", "repo:webapp/.env"} <= set(creds)
+    assert {"gh", "aws", "claude-login", f"file:{machine['webapp']}/.env"} <= set(creds)
     assert creds["claude-login"]["copyable"] is False
     assert "MY_SERVICE_API_KEY" in rep["flagged_env_names"]
     arrives = {s["key"]: s["arrives"] for s in rep["sessions"]}
@@ -159,15 +159,19 @@ def test_path_map_longest_prefix():
     assert pm.map("/opt/x") == "/opt/x"
 
 
-def test_rewrite_cwds_touches_only_cwd_fields():
+def test_rewrite_cwds_touches_only_cwd_metadata():
     pm = stg.PathMap()
     pm.add("/Users/a/web", "/root/src/web")
-    rec = {"cwd": "/Users/a/web", "message": {"content": [{"type": "thinking", "thinking": "/Users/a/web", "signature": "s"}]},
-           "payload": {"workspace_roots": ["/Users/a/web"], "cwd": "/Users/a/web/x"}}
-    out = stg.rewrite_cwds(rec, pm)
+    claude = {"cwd": "/Users/a/web", "message": {"content": [
+        {"type": "thinking", "thinking": "/Users/a/web", "signature": "s"},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "ls", "cwd": "/Users/a/web"}}]}}
+    out = stg.rewrite_cwds(claude, pm)
     assert out["cwd"] == "/root/src/web"
-    assert out["payload"] == {"workspace_roots": ["/root/src/web"], "cwd": "/root/src/web/x"}
-    assert out["message"] == rec["message"]
+    assert out["message"] == claude["message"]  # nested cwd keys inside a message are content
+    codex = {"type": "turn_context", "payload": {"workspace_roots": ["/Users/a/web"], "cwd": "/Users/a/web/x"}}
+    assert stg.rewrite_cwds(codex, pm)["payload"] == {"workspace_roots": ["/root/src/web"], "cwd": "/root/src/web/x"}
+    item = {"type": "response_item", "payload": {"type": "function_call", "cwd": "/Users/a/web"}}
+    assert stg.rewrite_cwds(item, pm) == item
 
 
 def test_claude_slug():
@@ -240,12 +244,13 @@ def test_stage_for_claude(machine, tmp_path):
 
 
 def test_stage_copies_only_picked_credentials(machine, tmp_path):
-    home, manifest = stage_all(machine, tmp_path, "claude", creds=["gh", "repo:webapp/.env"])
+    env_id = f"file:{machine['webapp']}/.env"
+    home, manifest = stage_all(machine, tmp_path, "claude", creds=["gh", env_id])
     gh = home / ".config/gh/hosts.yml"
     assert gh.exists() and oct(gh.stat().st_mode & 0o777) == "0o600"
     assert (home / "src/webapp/.env").exists()
     assert not (home / ".aws").exists()
-    assert set(manifest["credentials_copied"]) == {"gh", "repo:webapp/.env"}
+    assert set(manifest["credentials_copied"]) == {"gh", env_id}
 
 
 def test_stage_refuses_agent_logins(machine, tmp_path):
@@ -314,6 +319,16 @@ def test_copy_into_merge_never_overwrites(tmp_path):
     assert keys == ["r:old", "handoff:new"]
     claude_md = (dest / "CLAUDE.md").read_text()
     assert claude_md.startswith("# Theirs") and "setup.sh" in claude_md
+
+
+def test_merge_finished_never_replaces():
+    existing = {"sessions": [{"key": "handoff:claude:1", "name": "fix-tests", "spec": {"name": "fix-tests"}}]}
+    rows = [{"key": "handoff:claude:1", "name": "fix-tests", "spec": {"name": "fix-tests"}},
+            {"key": "handoff:claude:2", "name": "fix-tests", "spec": {"name": "fix-tests"}}]
+    merged, skipped = stg.merge_finished(existing, rows)
+    assert skipped == ["handoff:claude:1"]
+    assert [(r["key"], r["name"], r["spec"]["name"]) for r in merged["sessions"]] == [
+        ("handoff:claude:1", "fix-tests", "fix-tests"), ("handoff:claude:2", "fix-tests-2", "fix-tests-2")]
 
 
 FAKE_FLYTE = textwrap.dedent("""\
@@ -412,3 +427,201 @@ def test_non_git_cwd_and_empty_repo_travel_as_trees(machine, tmp_path):
     assert (out / "home/src/scratch/data.csv").exists()
     assert not (out / "home/src/scratch/node_modules").exists()
     assert (out / "home/src/fresh/main.py").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from review
+
+
+def test_every_copy_path_leaves_unpicked_secrets_behind(machine, tmp_path):
+    web = Path(machine["webapp"])
+    (web / ".npmrc").write_text(f"//registry/:_authToken={world.FAKE_SECRET}\n")
+    (web / "id_ed25519").write_text(world.FAKE_SECRET)
+    plain = Path(machine["home"]) / "notes"
+    plain.mkdir()
+    (plain / ".env").write_text(world.FAKE_SECRET)
+    (plain / "todo.md").write_text("x")
+    skill = Path(machine["home"]) / ".claude/skills/my-skill"
+    (skill / "login.json").symlink_to(Path(machine["home"]) / ".claude/.credentials.json")
+    mem = next(Path(machine["home"]).glob(".claude/projects/*/memory"))
+    (mem / "token.json").write_text(world.FAKE_SECRET)
+    t = tmp_path / "t.jsonl"
+    t.write_text("{}\n")
+    pool = hz.discover()
+    sessions = [hz.find(machine["claude"], pool), hz.find(f"file:{t}@{plain}")]
+    out = tmp_path / "o"
+    m = stg.stage(sessions, stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
+    home = out / "home"
+    assert not (home / "src/webapp/.npmrc").exists() and not (home / "src/webapp/id_ed25519").exists()
+    assert (home / "src/notes/todo.md").exists() and not (home / "src/notes/.env").exists()
+    assert not (home / ".claude/skills/my-skill/login.json").exists()
+    assert (home / ".claude/skills/my-skill/SKILL.md").exists()
+    assert not list(home.rglob("token.json"))
+    everything = b"".join(f.read_bytes() for f in home.rglob("*") if f.is_file())
+    assert world.FAKE_SECRET.encode() not in everything
+    assert m["extras"]["left_behind"]
+
+
+def test_secrets_in_a_transcript_stop_staging(machine, tmp_path):
+    t = next(Path(machine["home"]).glob(".claude/projects/*/*.jsonl"))
+    token = "ghp_" + "A1b2C3d4" * 5
+    with t.open("a") as fh:
+        fh.write(json.dumps({"type": "user", "cwd": str(machine["webapp"]), "message": {"role": "user", "content": f"use {token}"}}) + "\n")
+    s = hz.find(machine["claude"])
+    with pytest.raises(SystemExit) as e:
+        stg.stage([s], stg.StageOptions(out=tmp_path / "o", remote_harness="claude", log=lambda x: None))
+    assert "GitHub token" in str(e.value) and token not in str(e.value)
+    assert not (tmp_path / "o" / "home").exists()
+    rep = __import__("handoff").build_report([s], None)
+    assert rep["sessions"][0]["secrets_in_transcript"] == {"GitHub token": 1}
+    assert token not in json.dumps(rep)
+    stg.stage([s], stg.StageOptions(out=tmp_path / "o2", remote_harness="claude", allow_transcript_secrets=True, log=lambda x: None))
+
+
+def test_remote_url_credentials_are_redacted(machine, tmp_path):
+    web = Path(machine["webapp"])
+    subprocess.run(["git", "-C", str(web), "remote", "set-url", "origin",
+                    f"https://bob:{world.FAKE_SECRET}@github.com/example/webapp.git"], check=True)
+    proc = run_cli(machine, "report", "--session", machine["claude"])
+    assert world.FAKE_SECRET not in proc.stdout and "https://github.com/example/webapp.git" in proc.stdout
+    home, _ = stage_all(machine, tmp_path, "claude")
+    assert world.FAKE_SECRET not in (home / "src/webapp/.git/config").read_text()
+
+
+def test_bundle_with_default_branch_main(machine, tmp_path, monkeypatch):
+    # git init in the destination would check out `main`, and the bundle has a main.
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "init.defaultBranch")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "main")
+    infra = Path(machine["infra"])
+    assert _git(infra, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    home, _ = stage_all(machine, tmp_path, "claude")
+    assert _git(home / "src/infra", "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert "union-handoff-unborn" not in _git(home / "src/infra", "branch")
+
+
+def test_untrusted_codex_id_is_not_a_path(machine, tmp_path):
+    f = next(Path(machine["home"]).glob(".codex/sessions/**/*.jsonl"))
+    lines = f.read_text().splitlines()
+    meta = json.loads(lines[0])
+    meta["payload"]["id"] = "../../../escape"
+    f.write_text("\n".join([json.dumps(meta)] + lines[1:]) + "\n")
+    s = hz.find(machine["codex"])
+    assert s.id == world.CODEX_ID  # falls back to the id in the file name
+    out = tmp_path / "o"
+    stg.stage([s], stg.StageOptions(out=out, remote_harness="codex", log=lambda x: None))
+    assert not (tmp_path / "escape").exists()
+
+
+def test_shell_only_repo_is_found(machine, tmp_path):
+    other = Path(machine["home"]) / "code" / "tools"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    t = tmp_path / "s.jsonl"
+    t.write_text(json.dumps({"tool": {"command": f"cd {other} && make"}}) + "\n")
+    rep = __import__("handoff").build_report([hz.find(f"file:{t}@{machine['webapp']}")], None)
+    assert str(other) in {r["path"] for r in rep["repos"]}
+
+
+def test_database_handoff_carries_the_whole_conversation(machine, tmp_path):
+    db = Path(machine["home"]) / ".hermes/state.db"
+    import sqlite3
+    con = sqlite3.connect(db)
+    con.execute("insert into messages (session_id, role, content) values (?,?,?)", (world.HERMES_ID, "user", "a distinctive middle message"))
+    con.execute("insert into messages (session_id, role, content) values (?,?,?)", (world.HERMES_ID, "assistant", "the final answer"))
+    con.commit()
+    con.close()
+    out = tmp_path / "o"
+    stg.stage([hz.find(machine["hermes"])], stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
+    text = (out / "home/handoff/write-docs/transcript.md").read_text()
+    assert "Write the docs" in text and "a distinctive middle message" in text and "$ mkdocs build" in text
+
+
+def test_non_utf8_untracked_filename(machine, tmp_path):
+    web = os.fsencode(str(machine["webapp"]))
+    with open(web + b"/notes-\xff.txt", "wb") as fh:
+        fh.write(b"bytes")
+    home, _ = stage_all(machine, tmp_path, "claude")
+    assert os.path.exists(os.fsencode(str(home / "src/webapp")) + b"/notes-\xff.txt")
+
+
+def test_out_inside_a_copied_tree_is_refused(machine, tmp_path):
+    with pytest.raises(SystemExit):
+        stg.stage([hz.find(machine["claude"])],
+                  stg.StageOptions(out=Path(machine["webapp"]) / "handoff-out", remote_harness="claude", log=lambda x: None))
+
+
+def test_unknown_or_ambiguous_credential_ids_are_refused(machine, tmp_path):
+    for bad in ("file:/etc/passwd", f"file:{machine['webapp']}/missing.env", "nope"):
+        with pytest.raises(SystemExit):
+            stage_all(machine, tmp_path / bad.replace("/", "_"), "claude", creds=[bad])
+
+
+def test_setup_script_fails_without_marking_done(tmp_path):
+    tool = inv.Tool("definitely-not-a-tool", 1, None, "unknown", None, "true")
+    script = tmp_path / "setup.sh"
+    script.write_text(stg.setup_script([tool]))
+    (tmp_path / ".handoff").mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for b in ("stat", "id", "touch", "true"):
+        (bin_dir / b).symlink_to(__import__("shutil").which(b))
+    proc = subprocess.run(["/bin/bash", str(script)], env={"HOME": str(tmp_path), "PATH": str(bin_dir)},
+                          text=True, capture_output=True)
+    assert proc.returncode == 1 and "definitely-not-a-tool" in proc.stderr
+    assert not (tmp_path / ".handoff/setup.done").exists()
+
+
+def _fake_flyte(tmp_path) -> Path:
+    flyte = tmp_path / "flyte"
+    flyte.write_text(FAKE_FLYTE)
+    flyte.chmod(0o755)
+    return flyte
+
+
+def test_merge_refuses_a_home_that_already_has_the_repo(machine, tmp_path, monkeypatch):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    mnt = tmp_path / "mnt"
+    (mnt / "src/webapp").mkdir(parents=True)
+    (mnt / "src/webapp/theirs.txt").write_text("theirs")
+    monkeypatch.setattr(sl.os.path, "ismount", lambda p: Path(p, ".mounted").exists())
+    fake = FAKE_FLYTE.replace('mnt = argv[argv.index("--mount") + 1] if "--mount" in argv else argv[2]', "mnt = argv[2]")
+    flyte = tmp_path / "flyte"
+    flyte.write_text(fake)
+    flyte.chmod(0o755)
+    with pytest.raises(SystemExit) as e:
+        sl.seal(sl.SealOptions(staged_home=home, merge_artifact="agent-home", flyte=str(flyte), mountpoint=mnt,
+                               mount_timeout=30, publish_timeout=30))
+    assert "src/webapp" in str(e.value)
+    assert not (mnt / "src/webapp/.git").exists() and not (mnt / ".agent-sessions").exists()
+
+
+def test_merge_never_writes_through_a_symlink(tmp_path):
+    src, dest, outside = tmp_path / "src", tmp_path / "dest", tmp_path / "outside"
+    (src / "a/b").mkdir(parents=True)
+    (src / "a/b/f.txt").write_text("x")
+    outside.mkdir()
+    dest.mkdir()
+    (dest / "a").symlink_to(outside)
+    with pytest.raises(sl.Collision):
+        sl.copy_into(src, dest, merge=True)
+    assert not list(outside.iterdir())
+
+
+def test_interrupted_copy_leaves_the_mount_unpublished(machine, tmp_path, monkeypatch):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    flyte = _fake_flyte(tmp_path)
+    mnt = tmp_path / "mnt"
+    monkeypatch.setattr(sl.os.path, "ismount", lambda p: Path(p, ".mounted").exists())
+
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sl, "copy_into", boom)
+    with pytest.raises(SystemExit) as e:
+        sl.seal(sl.SealOptions(staged_home=home, volume="v", flyte=str(flyte), mountpoint=mnt, mount_timeout=30))
+    msg = str(e.value)
+    assert "nothing has been published" in msg
+    pid = int(msg.split("pid ")[1].split(",")[0])
+    os.kill(pid, 0)  # the mount is still up: it was neither signalled nor published
+    os.kill(pid, 9)

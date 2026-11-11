@@ -44,6 +44,9 @@ class ScenarioResult:
         }
 
 
+ENV_ALLOWLIST = {"PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TZ", "SYSTEMROOT", "PYTHONPATH"}
+
+
 def evaluate_static(sc: Scenario, manifest: Manifest) -> ScenarioResult:
     return ScenarioResult(sc.id, sc.skill, sc.tier, lint_skill(manifest.skill_dir(sc.skill)))
 
@@ -59,11 +62,10 @@ def evaluate_script(sc: Scenario, manifest: Manifest) -> ScenarioResult:
         variables.setdefault("root", str(root))
         home = variables.get("home", str(root))
         args = [substitute(a, variables) for a in sc.args]
-        env = {
-            k: v for k, v in os.environ.items()
-            # The script must see only the fixture's world, not the runner's.
-            if not k.endswith(("_TOKEN", "_API_KEY", "_SECRET")) and k not in ("CODEX_HOME", "CLAUDE_CONFIG_DIR")
-        }
+        # An allowlist, not a denylist: harness overrides (CODEX_HOME,
+        # OPENCODE_DB, XDG_DATA_HOME, KUBECONFIG, ...) would point the script at
+        # the runner's real sessions and credentials instead of the fixture's.
+        env = {k: v for k, v in os.environ.items() if k in ENV_ALLOWLIST}
         env.update({"HOME": home, "NO_COLOR": "1", "GIT_CONFIG_NOSYSTEM": "1"})
         env.update(getattr(fixture, "ENV", {}))
         proc = subprocess.run(
