@@ -16,6 +16,11 @@
                   [--bucket URI] [--project P --domain D] [--dry-run]
       Copy the staged home into a new (or forked) Union Volume and seal it.
 
+  handoff.py launch --locator LOC --identifier NAME --launcher-task TASK
+                    --project P --domain D [--dry-run]
+      Start a Union agent with the sealed volume as its home (sessions not
+      started), through `flyte run deployed-task`.
+
 Standard library only (Python 3.9+). Reads never write; stage writes only
 under --out; seal writes only into the volume it mounts.
 """
@@ -302,6 +307,36 @@ def cmd_seal(args) -> int:
     return 0
 
 
+def launch_command(args) -> list[str]:
+    return [args.flyte, "run", "--project", args.project, "--domain", args.domain,
+            "deployed-task", args.launcher_task,
+            "--identifier", args.identifier, "--home_locator", args.locator]
+
+
+def cmd_launch(args) -> int:
+    """Start an agent whose home is the sealed volume. A new identifier makes
+    a new agent; the identifier of an existing agent that is off gives that
+    agent this home from now on (its later Turn ons continue from it). An
+    agent that is on is refused by Union: turn it off first."""
+    import shlex
+    import subprocess
+
+    cmd = launch_command(args)
+    if args.dry_run:
+        print(shlex.join(cmd))
+        return 0
+    print(f"$ {shlex.join(cmd)}", file=sys.stderr)
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    out = proc.stdout + proc.stderr
+    print(out[-3000:])
+    if proc.returncode != 0:
+        if "AgentAlreadyOn" in out:
+            print(f"Agent {args.identifier!r} is on. Turn it off first, or pick a new identifier.", file=sys.stderr)
+        return proc.returncode
+    print(f"Started agent {args.identifier!r}. Its sessions wait under Done; Restart resumes each one.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="handoff.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
@@ -352,6 +387,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flyte", default="flyte", help="the flyte CLI to run")
     p.add_argument("--dry-run", action="store_true", help="print the flyte command only")
     p.set_defaults(func=cmd_seal)
+    p = sub.add_parser("launch", help="start a Union agent with the sealed volume as its home")
+    p.add_argument("--locator", required=True, help="the locator `seal` printed")
+    p.add_argument("--identifier", required=True,
+                   help="the agent's name: a new one, or an existing agent that is turned off (to give it this home)")
+    p.add_argument("--launcher-task", required=True, help="the deployed task that starts agents in your org")
+    p.add_argument("--project", required=True, help="the project the launcher lives in")
+    p.add_argument("--domain", required=True, help="the domain the launcher lives in")
+    p.add_argument("--flyte", default="flyte", help="the flyte CLI to run")
+    p.add_argument("--dry-run", action="store_true", help="print the command only")
+    p.set_defaults(func=cmd_launch)
     return ap
 
 

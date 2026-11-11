@@ -185,12 +185,27 @@ mount yourself.
 ## 7. Start the agent
 
 `seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`).
-Do not start any session; they wait in the home, finished.
+Start an agent with it as its home; do not start any session, they wait in
+the home, finished.
 
-In the Union console, open **New agent** and paste the locator into
-**Home volume** (an optional field). The agent boots with the handoff as its
-home. The field takes a locator, not an artifact name, so keep the one `seal`
-printed (it is also in the JSON `seal` writes, under `locator`).
+```bash
+python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name> \
+  --launcher-task <launcher-task> --project <project> --domain <domain>
+```
+
+This runs `flyte run deployed-task <launcher-task> --identifier <agent-name>
+--home_locator <locator>` in the project and domain where your organization
+runs agents. Ask the user, or their Union admin, for those three values; add
+`--dry-run` to show the command first. Use a new name for `--identifier`:
+that creates the agent. The run `flyte` prints is the agent's; it stays
+running while the agent is on.
+
+A Claude agent with no login of its own uses the launching user's, and Union
+refuses to start it while another of their agents holds that login. If
+that happens, turn the other agent off, or give the new agent its own login.
+
+In the Union console the same is **New agent**, with the locator in the
+optional **Home volume** field.
 
 Then tell the user where to find each session:
 

@@ -980,3 +980,28 @@ def test_merge_collision_covers_reference_repos(machine, tmp_path):
     dest = tmp_path / "existing-home"
     (dest / "src/webapp").mkdir(parents=True)
     assert "src/webapp" in sl.collisions(home, dest)
+
+
+def test_launch_command(machine, tmp_path):
+    flyte = tmp_path / "flyte"
+    flyte.write_text("#!/bin/sh\necho \"$@\" > \"$0.argv\"\necho 'Created Run: abc123'\n")
+    flyte.chmod(0o755)
+    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent",
+            "--launcher-task", "<launcher-task>", "--project", "<project>", "--domain", "<domain>"]
+    dry = run_cli(machine, *args, "--dry-run")
+    assert dry.returncode == 0
+    assert dry.stdout.strip() == ("flyte run --project '<project>' --domain '<domain>' deployed-task '<launcher-task>' "
+                                  "--identifier my-agent --home_locator s3://b/v/x.metadata.json")
+    real = run_cli(machine, *args, "--flyte", str(flyte))
+    assert real.returncode == 0 and "Created Run: abc123" in real.stdout
+    assert Path(str(flyte) + ".argv").read_text().split()[-4:] == [
+        "--identifier", "my-agent", "--home_locator", "s3://b/v/x.metadata.json"]
+
+
+def test_launch_explains_an_agent_that_is_on(machine, tmp_path):
+    flyte = tmp_path / "flyte"
+    flyte.write_text("#!/bin/sh\necho 'AgentAlreadyOn: my-agent is on' >&2\nexit 1\n")
+    flyte.chmod(0o755)
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "my-agent", "--launcher-task", "t",
+                   "--project", "p", "--domain", "d", "--flyte", str(flyte))
+    assert proc.returncode == 1 and "Turn it off first" in proc.stderr
