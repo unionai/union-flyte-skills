@@ -1,0 +1,18 @@
+id: union-handoff-stage-claude
+skill: union-handoff
+tier: script
+# Staging for a Claude agent: the Claude session re-keyed and listed as
+# finished, the others as written handoffs, no credential copied by default.
+fixture: handoff_world
+script: scripts/handoff.py
+args: [stage, --out, "{root}/out", --remote-harness, claude, --session, "{claude}", --session, "{codex}"]
+checks:
+  - kind: exit_code
+  - {kind: file_exists, glob: "out/home/.claude/projects/-root-src-webapp/*.jsonl"}
+  - {kind: file_regex, glob: "out/home/.claude/projects/-root-src-webapp/*.jsonl", pattern: "\"cwd\":\"/root/src/webapp\""}
+  - {kind: file_regex, glob: "out/home/.agent-sessions/finished.json", pattern: "\"resume_session_id\": \"11111111-2222-4333-8444-555555555555\""}
+  - {kind: file_exists, glob: "out/home/handoff/upgrade-terraform-providers/HANDOFF.md"}
+  - {kind: file_exists, glob: "out/home/src/webapp/.git"}
+  - {kind: file_exists, glob: "out/home/src/infra/.git"}
+  - {kind: file_regex, glob: "out/home/.handoff/setup.sh", pattern: "^need terraform "}
+  - {kind: not_regex, name: no secret value printed, pattern: "{secret}"}

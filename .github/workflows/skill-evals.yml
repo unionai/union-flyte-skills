@@ -18,11 +18,18 @@ env:
 jobs:
   evals:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the oldest Python the skills' scripts promise to run on.
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
+      # zstd: Codex compresses older transcripts, and a test reads one.
+      - run: sudo apt-get install -y zstd
       - run: pip install pytest pyyaml
       - name: Unit tests
         run: python -m pytest -q

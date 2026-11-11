@@ -1,0 +1,481 @@
+"""What a set of sessions depends on: repos, tools and credentials.
+
+All of it is read-only and reports names, paths and sizes. It never prints a
+credential's value: a credential is reported by where it lives and what kind
+of thing it is, and the user decides per item whether it travels.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable, Optional
+
+# Directories that are rebuilt, not moved, when copying a tree that is not a
+# git repo (and that never count toward its size).
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".tox", ".next", "dist", "build", "target", ".gradle", ".cache",
+}
+
+# Filenames that hold secrets. An untracked one inside a repo is reported as a
+# credential and left behind unless the user picks it.
+SECRET_FILE_RE = re.compile(r"^(\.env(\..+)?|.*\.pem|.*\.key|credentials(\.json)?|.*secret.*\.(json|ya?ml))$", re.I)
+
+
+def _git(repo: Path, *args: str, check: bool = False) -> str:
+    proc = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}")
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def git_toplevel(path: Path) -> Optional[Path]:
+    p = path if path.is_dir() else path.parent
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    top = _git(p, "rev-parse", "--show-toplevel") if p.exists() else ""
+    return Path(top) if top else None
+
+
+# --------------------------------------------------------------------------- #
+# Repos
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Repo:
+    path: str
+    git: bool
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    remote: Optional[str] = None
+    branches: list[str] = field(default_factory=list)
+    unpushed_commits: int = 0
+    modified_files: int = 0
+    untracked_files: int = 0
+    untracked_bytes: int = 0
+    patch_bytes: int = 0
+    history_bytes: int = 0  # object store on disk: an upper bound for the bundle
+    tree_bytes: int = 0  # working tree, without SKIP_DIRS
+    secret_files: list[str] = field(default_factory=list)
+    sessions: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _dir_bytes(root: Path, skip: set[str] = SKIP_DIRS, limit_files: int = 200_000) -> int:
+    total = n = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for f in filenames:
+            n += 1
+            if n > limit_files:
+                return total
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def untracked(repo: Path) -> list[str]:
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True,
+    ).stdout.decode(errors="replace")
+    return [f for f in out.split("\0") if f]
+
+
+def describe_repo(path: Path) -> Repo:
+    top = git_toplevel(path)
+    if top is None:
+        return Repo(path=str(path), git=False, tree_bytes=_dir_bytes(path))
+    r = Repo(path=str(top), git=True)
+    r.branch = _git(top, "rev-parse", "--abbrev-ref", "HEAD") or None
+    r.head = _git(top, "rev-parse", "HEAD") or None
+    r.remote = _git(top, "remote", "get-url", "origin") or None
+    r.branches = [b for b in _git(top, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines() if b]
+    ahead = _git(top, "rev-list", "--count", "@{upstream}..HEAD")
+    r.unpushed_commits = int(ahead) if ahead.isdigit() else 0
+    status = _git(top, "status", "--porcelain")
+    r.modified_files = sum(1 for line in status.splitlines() if line and not line.startswith("??"))
+    files = untracked(top)
+    r.untracked_files = len(files)
+    for f in files:
+        if SECRET_FILE_RE.match(Path(f).name):
+            r.secret_files.append(f)
+        try:
+            r.untracked_bytes += (top / f).lstat().st_size
+        except OSError:
+            pass
+    r.patch_bytes = len(subprocess.run(["git", "-C", str(top), "diff", "HEAD", "--binary"], capture_output=True).stdout)
+    common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common:
+        r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())
+    r.tree_bytes = _dir_bytes(top)
+    return r
+
+
+def repos_for(cwds: Iterable[str], paths: Iterable[str], home: Path) -> list[Path]:
+    """Git toplevels behind the cwds and tool paths a session recorded.
+
+    Paths that no longer exist are skipped, as is the home directory itself
+    (a dotfiles repo at ~ is not the project).
+    """
+    tops: list[Path] = []
+    for raw in list(cwds) + list(paths):
+        if not raw:
+            continue
+        p = Path(os.path.expanduser(raw))
+        if not p.is_absolute() or not p.exists():
+            continue
+        top = git_toplevel(p)
+        if top is None or top == home or top in tops:
+            continue
+        tops.append(top)
+    return tops
+
+
+# --------------------------------------------------------------------------- #
+# Tools
+# --------------------------------------------------------------------------- #
+
+# Shell builtins and the base system every Linux image already has; counting
+# them would bury the tools that matter.
+BASE_COMMANDS = set("""
+alias awk basename bash break cat cd chmod chown clear command comm cp curl cut date dd declare df diff dirname du echo
+egrep env eval exec exit export expr false fgrep file find for fi grep gunzip gzip head history hostname id if in jobs
+kill less let ln local ls mkdir mktemp more mv nohup popd printf ps pushd pwd read readlink realpath return rm rmdir sed
+seq set sh shift sleep sort source stat sudo tail tar tee test then time timeout touch tr trap true type ulimit umask
+unalias uname uniq unset unzip until wait watch wc wget which while whoami xargs yes zip zsh done do else elif case esac
+function select tput sha256sum md5sum shasum base64 nproc free top kill pkill pgrep lsof open pbcopy pbpaste
+""".split())
+
+# Binary -> install hints on Linux, for the common tools whose package name or
+# installer differs from the binary name. Anything else falls back to how it was
+# installed locally (npm/pip/cargo/uv) or to a TODO line.
+KNOWN_TOOLS: dict[str, dict[str, str]] = {
+    "gh": {"apt": "gh", "brew": "gh"},
+    "jq": {"apt": "jq", "brew": "jq"},
+    "yq": {"brew": "yq", "pip": "yq"},
+    "rg": {"apt": "ripgrep", "brew": "ripgrep"},
+    "fd": {"apt": "fd-find", "brew": "fd"},
+    "tree": {"apt": "tree", "brew": "tree"},
+    "make": {"apt": "make"},
+    "git": {"apt": "git"},
+    "python": {"apt": "python3"},
+    "python3": {"apt": "python3"},
+    "pip": {"apt": "python3-pip"},
+    "pip3": {"apt": "python3-pip"},
+    "node": {"apt": "nodejs", "brew": "node"},
+    "npm": {"apt": "npm", "brew": "node"},
+    "npx": {"apt": "npm", "brew": "node"},
+    "pnpm": {"npm": "pnpm"},
+    "yarn": {"npm": "yarn"},
+    "go": {"apt": "golang-go", "brew": "go"},
+    "cargo": {"script": "curl -fsSL https://sh.rustup.rs | sh -s -- -y"},
+    "rustc": {"script": "curl -fsSL https://sh.rustup.rs | sh -s -- -y"},
+    "uv": {"script": "curl -LsSf https://astral.sh/uv/install.sh | sh"},
+    "uvx": {"script": "curl -LsSf https://astral.sh/uv/install.sh | sh"},
+    "kubectl": {"brew": "kubectl"},
+    "helm": {"brew": "helm"},
+    "kind": {"brew": "kind"},
+    "k9s": {"brew": "k9s"},
+    "terraform": {"brew": "terraform"},
+    "aws": {"pip": "awscli"},
+    "gcloud": {"todo": "install the Google Cloud CLI: https://cloud.google.com/sdk/docs/install"},
+    "az": {"pip": "azure-cli"},
+    "docker": {"todo": "docker needs a daemon; Union agents usually build images with flyte instead"},
+    "flyte": {"uv": "flyte"},
+    "pytest": {"pip": "pytest"},
+    "ruff": {"uv": "ruff"},
+    "black": {"uv": "black"},
+    "mypy": {"pip": "mypy"},
+    "tsc": {"npm": "typescript"},
+    "eslint": {"npm": "eslint"},
+    "prettier": {"npm": "prettier"},
+    "claude": {"npm": "@anthropic-ai/claude-code"},
+    "codex": {"npm": "@openai/codex"},
+    "psql": {"apt": "postgresql-client", "brew": "libpq"},
+    "redis-cli": {"apt": "redis-tools", "brew": "redis"},
+    "sqlite3": {"apt": "sqlite3", "brew": "sqlite"},
+    "ffmpeg": {"apt": "ffmpeg", "brew": "ffmpeg"},
+    "protoc": {"apt": "protobuf-compiler", "brew": "protobuf"},
+    "buf": {"brew": "bufbuild/buf/buf"},
+    "just": {"brew": "just", "cargo": "just"},
+}
+
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_WRAPPERS = {"sudo", "env", "time", "nohup", "exec", "command", "builtin", "nice", "timeout", "xargs",
+             "then", "do", "else", "elif", "if", "while", "until", "!", "{", "(", "}", ")"}
+# Options of a wrapper that take a value, so the value is not the program.
+_WRAPPER_VALUE_OPTS = {"-u", "-C", "-n", "-s", "-k", "--signal", "--kill-after"}
+
+
+def split_segments(command: str) -> list[str]:
+    """Split a shell command line into simple commands at ``&& || ; | &``,
+    newlines and ``$(`` / backticks, outside quotes. Heredoc bodies are
+    dropped: they are data, not commands."""
+    segments, cur = [], []
+    i, n = 0, len(command)
+    quote = None
+    pending_heredocs: list[str] = []
+    while i < n:
+        c = command[i]
+        if quote:
+            cur.append(c)
+            if c == "\\" and quote == '"' and i + 1 < n:
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in "'\"":
+            quote = c
+            cur.append(c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            if command[i + 1] != "\n":
+                cur.append(command[i:i + 2])
+            i += 2
+            continue
+        if c == "<" and command.startswith("<<", i) and not command.startswith("<<<", i):
+            m = _HEREDOC_RE.match(command, i)
+            if m:
+                pending_heredocs.append(m.group(2))
+                cur.append(m.group(0))
+                i = m.end()
+                continue
+        if c == "\n" or c in ";|&" or (c == "$" and command.startswith("$(", i)) or c == "`":
+            segments.append("".join(cur))
+            cur = []
+            if c == "\n" and pending_heredocs:
+                # Skip each heredoc body up to its terminator line.
+                for tag in pending_heredocs:
+                    j = i + 1
+                    while j <= n:
+                        end = command.find("\n", j)
+                        line = command[j:end if end != -1 else n]
+                        j = (end + 1) if end != -1 else n + 1
+                        if line.strip() == tag:
+                            break
+                    i = j - 1
+                pending_heredocs = []
+            i += 2 if command.startswith(("&&", "||", "$("), i) else 1
+            continue
+        if c == "#" and (not cur or cur[-1].isspace()):
+            end = command.find("\n", i)
+            i = n if end == -1 else end
+            continue
+        cur.append(c)
+        i += 1
+    segments.append("".join(cur))
+    return [seg.strip() for seg in segments if seg.strip()]
+
+
+def command_names(command: str) -> list[str]:
+    """The program each simple command in a shell command line runs."""
+    names = []
+    for segment in split_segments(command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        i = 0
+        while i < len(words):
+            w = words[i]
+            prev = words[i - 1] if i else ""
+            if _ASSIGN_RE.match(w) or w in _WRAPPERS:
+                i += 1
+                continue
+            if w.startswith("-"):
+                i += 2 if w in _WRAPPER_VALUE_OPTS else 1
+                continue
+            if prev == "timeout" and re.match(r"^\d", w):
+                i += 1
+                continue
+            name = os.path.basename(w)
+            if re.match(r"^[A-Za-z0-9][\w.+-]*$", name):
+                names.append(name)
+            break
+    return names
+
+
+@dataclass
+class Tool:
+    name: str
+    count: int
+    local_path: Optional[str] = None
+    installed_by: Optional[str] = None  # brew | npm | pip | uv | pipx | cargo | go | system | project | unknown
+    package: Optional[str] = None
+    linux_install: Optional[str] = None  # one shell line, or None when the image should already have it
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _installed_by(name: str, path: Optional[str], home: Path) -> tuple[str, Optional[str]]:
+    if not path:
+        return "unknown", None
+    real = os.path.realpath(path)
+    m = re.search(r"/Cellar/([^/]+)/", real)
+    if m or real.startswith(("/opt/homebrew/", "/home/linuxbrew/")):
+        return "brew", m.group(1) if m else name
+    m = re.search(r"/node_modules/((?:@[^/]+/)?[^/]+)/", real)
+    if m:
+        return "npm", m.group(1)
+    m = re.search(r"/uv/tools/([^/]+)/", real)
+    if m:
+        return "uv", m.group(1)
+    m = re.search(r"/pipx/venvs/([^/]+)/", real)
+    if m:
+        return "pipx", m.group(1)
+    if real.startswith(str(home / ".cargo")):
+        return "cargo", name
+    if real.startswith(str(home / "go" / "bin")):
+        return "go", name
+    if real.startswith(str(home)):
+        return "project", None
+    return "system", None
+
+
+def linux_install_line(tool: Tool) -> Optional[str]:
+    """One shell line that installs ``tool`` on a Linux agent, or None when
+    there is nothing to install. Known tools first, then however the tool was
+    installed locally, then a TODO the agent (or the user) fills in."""
+    hint = KNOWN_TOOLS.get(tool.name, {})
+    pkg = tool.package or tool.name
+    if "script" in hint:
+        return hint["script"]
+    if "apt" in hint:
+        return f"apt_install {hint['apt']}"
+    if "npm" in hint:
+        return f"npm install -g {hint['npm']}"
+    if "uv" in hint:
+        return f"uv tool install {hint['uv']}"
+    if "pip" in hint:
+        return f"pip install --user {hint['pip']}"
+    if tool.installed_by == "npm":
+        return f"npm install -g {pkg}"
+    if tool.installed_by in ("uv", "pipx"):
+        return f"uv tool install {pkg}"
+    if tool.installed_by == "cargo":
+        return f"cargo install {hint.get('cargo', pkg)}"
+    if tool.installed_by == "go":
+        return f"# TODO go install <module>@latest   # {tool.name}: module path unknown"
+    if "brew" in hint or tool.installed_by == "brew":
+        return f"brew_install {hint.get('brew', pkg)}"
+    if "todo" in hint:
+        return f"# TODO {hint['todo']}"
+    if tool.installed_by in ("system", "project"):
+        return None  # part of the OS, or lives in a repo/venv that travels with it
+    return f"# TODO {tool.name}: not found locally, so how to install it is unknown"
+
+
+def tools_from(commands: Iterable[str], home: Path) -> list[Tool]:
+    counts: Counter = Counter()
+    for c in commands:
+        counts.update(n for n in command_names(c) if n not in BASE_COMMANDS)
+    out = []
+    for name, count in counts.most_common():
+        path = shutil.which(name)
+        if path is None and name not in KNOWN_TOOLS and not re.match(r"^[a-z][a-z0-9_+-]*$", name):
+            continue  # not a program anyone could install: a stray word, a path, a variable
+        by, pkg = _installed_by(name, path, home)
+        t = Tool(name, count, path, by, pkg)
+        t.linux_install = linux_install_line(t)
+        out.append(t)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Credentials
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Credential:
+    id: str
+    kind: str
+    path: str  # absolute local path
+    rel: Optional[str]  # path relative to home, where it would land remotely
+    advice: str
+    copyable: bool = True
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# (id, kind, path relative to home, what to do instead of copying it)
+CREDENTIAL_PATHS = [
+    ("gh", "GitHub CLI login", ".config/gh/hosts.yml", "run `gh auth login` in the agent, or give it a GH_TOKEN secret"),
+    ("git-credentials", "git credential store", ".git-credentials", "sign in again in the agent"),
+    ("netrc", "netrc logins", ".netrc", "sign in again in the agent"),
+    ("aws", "AWS credentials", ".aws/credentials", "use a project secret or an IAM role for the agent"),
+    ("aws-config", "AWS config and profiles", ".aws/config", "safe to copy if it holds only profiles and regions"),
+    ("aws-sso", "AWS SSO token cache", ".aws/sso/cache", "run `aws sso login` in the agent instead"),
+    ("gcloud", "Google Cloud login", ".config/gcloud", "run `gcloud auth login` in the agent, or use a service account secret"),
+    ("azure", "Azure CLI login", ".azure", "run `az login` in the agent"),
+    ("kubeconfig", "Kubernetes contexts", ".kube/config", "copying gives the agent your cluster access; prefer a scoped kubeconfig secret"),
+    ("docker", "Docker registry logins", ".docker/config.json", "use a registry secret instead"),
+    ("npmrc", "npm registry token", ".npmrc", "use a project secret for the token"),
+    ("pypirc", "PyPI upload token", ".pypirc", "use a project secret for the token"),
+    ("cargo", "crates.io token", ".cargo/credentials.toml", "use a project secret for the token"),
+    ("terraform", "Terraform Cloud token", ".terraform.d/credentials.tfrc.json", "use a project secret for the token"),
+    ("flyte", "Flyte/Union CLI config", ".flyte/config.yaml", "the agent already runs inside Union; usually not needed"),
+    ("union", "Union CLI config", ".union/config.yaml", "the agent already runs inside Union; usually not needed"),
+]
+
+# Never offered: the agent signs in to its own model provider.
+AGENT_LOGINS = [
+    ("claude-login", "Claude Code login", ".claude/.credentials.json"),
+    ("codex-login", "Codex login", ".codex/auth.json"),
+]
+
+SECRET_ENV_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)", re.I)
+
+
+def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = None) -> tuple[list[Credential], list[str]]:
+    """Credential files found, and the NAMES of secret-looking environment
+    variables (values are never read into the report)."""
+    found: list[Credential] = []
+    for cid, kind, rel, advice in CREDENTIAL_PATHS:
+        p = home / rel
+        if p.exists():
+            found.append(Credential(cid, kind, str(p), rel, advice))
+    ssh = home / ".ssh"
+    if ssh.is_dir():
+        for key in sorted(ssh.glob("id_*")):
+            if key.suffix != ".pub" and key.is_file():
+                found.append(Credential(f"ssh:{key.name}", "SSH private key", str(key), f".ssh/{key.name}",
+                                        "add a deploy key or use HTTPS with a token instead"))
+    kubeconfig = (env or os.environ).get("KUBECONFIG")
+    if kubeconfig:
+        for k in kubeconfig.split(os.pathsep):
+            kp = Path(k).expanduser()
+            if kp.is_file() and kp != home / ".kube/config":
+                rel = str(kp.relative_to(home)) if kp.is_relative_to(home) else None
+                found.append(Credential(f"kubeconfig:{kp.name}", "Kubernetes contexts (KUBECONFIG)", str(kp), rel,
+                                        "prefer a scoped kubeconfig secret"))
+    for cid, kind, rel in AGENT_LOGINS:
+        p = home / rel
+        if p.exists():
+            found.append(Credential(cid, kind, str(p), rel, "never copied; the Union agent signs in on its own", copyable=False))
+    for repo in repos:
+        for f in repo.secret_files:
+            found.append(Credential(f"repo:{Path(repo.path).name}/{f}", "untracked secret file in a repo",
+                                    str(Path(repo.path) / f), None, "use a project secret, or copy it if the repo needs it"))
+    names = sorted(k for k in (env or os.environ) if SECRET_ENV_RE.search(k))
+    return found, names

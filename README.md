@@ -14,6 +14,7 @@ This repo holds the skills that need Union itself.
 
 | Skill | What it does |
 |---|---|
+| [`union-handoff`](plugins/union/skills/union-handoff/SKILL.md) | Moves sessions from your local coding agent (Claude Code, Codex, pi, opencode, Hermes) into a Union agent: repos, uncommitted work, transcripts, memory and skills, sealed into a Union Volume. Reports sizes, tools and credentials before copying anything. |
 | [`union-docs`](plugins/union/skills/union-docs/SKILL.md) | Finds the right Union docs page before answering, instead of guessing flags. |
 
 ## Install

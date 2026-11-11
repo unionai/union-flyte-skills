@@ -1,0 +1,18 @@
+id: union-handoff-report-text
+skill: union-handoff
+tier: script
+# The human-readable report the agent shows the user: every section present,
+# the binaries warning, the credential warning, and still no secret values.
+fixture: handoff_world
+script: scripts/handoff.py
+args: [report, --session, "{claude}", --session, "{codex}"]
+checks:
+  - kind: exit_code
+  - {kind: not_regex, name: no secret value printed, pattern: "{secret}"}
+  - {kind: stdout_regex, pattern: "^SESSIONS"}
+  - {kind: stdout_regex, pattern: "^REPOS"}
+  - {kind: stdout_regex, pattern: "binaries are never copied"}
+  - {kind: stdout_regex, pattern: "^CREDENTIALS"}
+  - {kind: stdout_regex, pattern: "claude-login .*\\[never copied\\]"}
+  - {kind: stdout_regex, pattern: "^SIZE"}
+  - {kind: stdout_regex, pattern: "arrives as: resumable on claude"}
