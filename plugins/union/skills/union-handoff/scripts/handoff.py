@@ -119,13 +119,13 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None) -> dict
     transcripts = sum(s.size_bytes for s in sessions)
     repo_bytes = 0
     for r in repos:
-        repo_bytes += (r.history_bytes + r.patch_bytes + r.untracked_bytes) if r.git else r.tree_bytes
+        repo_bytes += (r.history_bytes + r.patch_bytes + r.untracked_bytes) if (r.git and r.head) else r.tree_bytes
     return {
         "sessions": session_rows,
         "repos": [r.to_dict() for r in repos],
         "tools": [t.to_dict() for t in tools],
         "credentials": [c.to_dict() for c in creds],
-        "secret_env_vars": env_names,
+        "flagged_env_names": env_names,
         "totals": {
             "transcript_bytes": transcripts,
             "repo_bytes_upper_bound": repo_bytes,
@@ -146,7 +146,9 @@ def print_report(rep: dict) -> None:
     if not rep["repos"]:
         print("  none found (the sessions' working directories are not git repos)")
     for r in rep["repos"]:
-        if r["git"]:
+        if r["git"] and not r["head"]:
+            print(f"  {r['path']}  (git, no commits yet)  travels as: full tree, {human(r['tree_bytes'])}")
+        elif r["git"]:
             print(f"  {r['path']}  branch {r['branch']}  remote {r['remote'] or '(none)'}")
             print(f"    travels as: git bundle of {len(r['branches'])} local branch(es), remote-tracking branches and tags,"
                   f" up to {human(r['history_bytes'])} of history")
@@ -171,9 +173,9 @@ def print_report(rep: dict) -> None:
         flag = "" if c["copyable"] else "  [never copied]"
         print(f"  {c['id']:<26} {c['kind']}: {c['path']}{flag}")
         print(f"    {'' if not c['copyable'] else 'instead of copying: '}{c['advice']}")
-    if rep["secret_env_vars"]:
+    if rep["flagged_env_names"]:
         print("  environment variables that look secret (not copyable; use project secrets):")
-        print("    " + ", ".join(rep["secret_env_vars"]))
+        print("    " + ", ".join(rep["flagged_env_names"]))
     t = rep["totals"]
     print("\nSIZE")
     print(f"  transcripts {human(t['transcript_bytes'])}; repos up to {human(t['repo_bytes_upper_bound'])};"

@@ -125,23 +125,36 @@ def describe_repo(path: Path) -> Repo:
 
 
 def repos_for(cwds: Iterable[str], paths: Iterable[str], home: Path) -> list[Path]:
-    """Git toplevels behind the cwds and tool paths a session recorded.
+    """The project directories behind the cwds and tool paths a session
+    recorded: git toplevels, plus any working directory that is not in a git
+    repo (it travels as a plain tree).
 
-    Paths that no longer exist are skipped, as is the home directory itself
-    (a dotfiles repo at ~ is not the project).
+    Paths that no longer exist are skipped, as are the home directory itself
+    (a dotfiles repo at ~ is not the project) and the filesystem root.
     """
     tops: list[Path] = []
-    for raw in list(cwds) + list(paths):
-        if not raw:
-            continue
+    cwds = [c for c in cwds if c]
+    for raw in cwds + [p for p in paths if p]:
         p = Path(os.path.expanduser(raw))
         if not p.is_absolute() or not p.exists():
             continue
         top = git_toplevel(p)
-        if top is None or top == home or top in tops:
+        if top is None and raw in cwds and p.is_dir():
+            top = p.resolve()  # a working directory outside any repo
+        if top is None or top in (home, Path("/")) or top in tops:
             continue
+        if any(top != t and t in top.parents for t in tops if not is_git(t)):
+            continue  # inside a tree already being copied whole
         tops.append(top)
     return tops
+
+
+def is_git(path: Path) -> bool:
+    return git_toplevel(path) == path
+
+
+def has_commits(repo: Path) -> bool:
+    return bool(_git(repo, "rev-parse", "--verify", "--quiet", "HEAD"))
 
 
 # --------------------------------------------------------------------------- #
@@ -444,7 +457,7 @@ AGENT_LOGINS = [
     ("codex-login", "Codex login", ".codex/auth.json"),
 ]
 
-SECRET_ENV_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)", re.I)
+FLAGGED_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)", re.I)
 
 
 def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = None) -> tuple[list[Credential], list[str]]:
@@ -477,5 +490,5 @@ def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = No
         for f in repo.secret_files:
             found.append(Credential(f"repo:{Path(repo.path).name}/{f}", "untracked secret file in a repo",
                                     str(Path(repo.path) / f), None, "use a project secret, or copy it if the repo needs it"))
-    names = sorted(k for k in (env or os.environ) if SECRET_ENV_RE.search(k))
+    names = sorted(k for k in (env or os.environ) if FLAGGED_ENV_NAME_RE.search(k))
     return found, names

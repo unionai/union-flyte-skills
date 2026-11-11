@@ -442,8 +442,8 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     for top in repo_paths:
         dest = home / remote_of[str(top)][len(rh) + 1:]
         dest.parent.mkdir(parents=True, exist_ok=True)
-        is_git = inv.git_toplevel(top) == top
-        if is_git and str(top) not in opts.tree_repos:
+        is_git = inv.is_git(top)
+        if is_git and inv.has_commits(top) and str(top) not in opts.tree_repos:
             opts.log(f"repo  {top} -> {remote_of[str(top)]} (bundle)")
             info = stage_git_repo(top, dest, work, picked_secret_files.get(top.name, set()))
         else:

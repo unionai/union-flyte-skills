@@ -30,7 +30,7 @@ checks:
   - {kind: json_contains, path: "credentials[*].id", item: aws}
   - {kind: json_contains, path: "credentials[*].id", item: "repo:webapp/.env"}
   - {kind: json_contains, path: "credentials[*].id", item: claude-login}
-  - {kind: json_contains, path: "secret_env_vars", item: MY_SERVICE_API_KEY}
+  - {kind: json_contains, path: "flagged_env_names", item: MY_SERVICE_API_KEY}
   # How each session would arrive with the default remote harness.
   - {kind: json_equals, path: "sessions[0].arrives", equals: resumable}
   - {kind: json_equals, path: "sessions[1].arrives", equals: resumable}

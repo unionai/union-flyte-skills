@@ -125,7 +125,7 @@ def test_report_cli(machine):
     creds = {c["id"]: c for c in rep["credentials"]}
     assert {"gh", "aws", "claude-login", "repo:webapp/.env"} <= set(creds)
     assert creds["claude-login"]["copyable"] is False
-    assert "MY_SERVICE_API_KEY" in rep["secret_env_vars"]
+    assert "MY_SERVICE_API_KEY" in rep["flagged_env_names"]
     arrives = {s["key"]: s["arrives"] for s in rep["sessions"]}
     assert arrives[machine["claude"]] == "resumable"
     assert arrives[machine["codex"]] == "resumable"
@@ -388,3 +388,27 @@ def test_unknown_harness_by_file(machine, tmp_path):
     assert (out / "home/handoff/chat-jsonl/HANDOFF.md").exists()
     assert (out / "home/handoff/chat-jsonl/transcript.jsonl").exists()
     assert (out / "home/src/webapp/.git").is_dir()
+
+
+def test_non_git_cwd_and_empty_repo_travel_as_trees(machine, tmp_path):
+    plain = Path(machine["home"]) / "scratch"
+    plain.mkdir()
+    (plain / "data.csv").write_text("a,b\n")
+    (plain / "node_modules").mkdir()
+    (plain / "node_modules" / "big.js").write_text("x")
+    empty = Path(machine["home"]) / "fresh"
+    empty.mkdir()
+    subprocess.run(["git", "init", "-q", str(empty)], check=True)
+    (empty / "main.py").write_text("print(1)\n")
+    sessions = []
+    for i, d in enumerate((plain, empty)):
+        t = tmp_path / f"t{i}.jsonl"
+        t.write_text("{}\n")
+        sessions.append(hz.find(f"file:{t}@{d}"))
+    rep = __import__("handoff").build_report(sessions, "claude")
+    assert {r["path"] for r in rep["repos"]} == {str(plain), str(empty)}
+    out = tmp_path / "o"
+    stg.stage(sessions, stg.StageOptions(out=out, remote_harness="claude", log=lambda m: None))
+    assert (out / "home/src/scratch/data.csv").exists()
+    assert not (out / "home/src/scratch/node_modules").exists()
+    assert (out / "home/src/fresh/main.py").exists()
