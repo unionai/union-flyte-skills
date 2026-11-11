@@ -1,0 +1,8 @@
+{
+  "name": "union",
+  "description": "Agent skills for Union, the enterprise Flyte platform. Move local coding sessions into a Union agent, and more.",
+  "version": "0.1.0",
+  "author": {
+    "name": "unionai"
+  }
+}

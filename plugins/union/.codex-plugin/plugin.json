@@ -1,0 +1,6 @@
+{
+  "name": "union",
+  "version": "0.1.0",
+  "description": "Agent skills for Union, the enterprise Flyte platform. Move local coding sessions into a Union agent, and more.",
+  "skills": "./skills/"
+}

@@ -1,0 +1,32 @@
+name: skill-evals
+
+# Static lint of every skill, a public-content scan of the whole repo, the
+# harness and skill unit tests, and the script-tier scenarios. No LLM and no
+# secrets: everything here is deterministic and runs on a stock runner.
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest pyyaml
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Public-content lint
+        run: python -m evals.harness.public_lint
+      - name: Scenarios
+        run: python -m evals.harness.run -v

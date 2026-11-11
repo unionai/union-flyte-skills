@@ -1,0 +1,5 @@
+id: union-docs-static
+skill: union-docs
+tier: static
+# Lints the SKILL.md (frontmatter, fences, script references, no secrets,
+# nothing internal). No agent, no LLM.

@@ -1,0 +1,12 @@
+[project]
+name = "union-flyte-skills-evals"
+version = "0.0.1"
+description = "Eval harness for the Union agent skills."
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

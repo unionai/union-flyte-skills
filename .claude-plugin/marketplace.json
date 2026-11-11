@@ -1,0 +1,15 @@
+{
+  "name": "union-flyte-skills",
+  "owner": {
+    "name": "unionai",
+    "url": "https://github.com/unionai/union-flyte-skills"
+  },
+  "description": "Agent skills for working with Union.",
+  "plugins": [
+    {
+      "name": "union",
+      "source": "./plugins/union",
+      "description": "Agent skills for Union, the enterprise Flyte platform. Move local coding sessions into a Union agent, and more."
+    }
+  ]
+}

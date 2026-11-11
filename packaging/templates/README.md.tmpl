@@ -1,0 +1,37 @@
+# {{DIST}}
+
+{{DESCRIPTION}}
+
+Version {{VERSION}}. Source and issues: {{REPO_URL}}
+
+## Install the skills
+
+```bash
+uvx {{DIST}} install
+```
+
+That copies every bundled skill into each agent harness it finds on this
+machine. Pick explicitly with `--target` (repeatable):
+
+| `--target` | User-level directory | Project-level (`--project`) |
+|---|---|---|
+| `agents` | `~/.agents/skills/` | `.agents/skills/` |
+| `claude` | `~/.claude/skills/` | `.claude/skills/` |
+| `hermes` | `~/.hermes/skills/` | `.hermes/skills/` |
+| `opencode` | `~/.config/opencode/skills/` | `.opencode/skills/` |
+| `pi` | `~/.pi/agent/skills/` | none |
+
+`--target codex` is an alias for `agents`.
+
+```bash
+uvx {{DIST}} install --target claude   # one harness
+uvx {{DIST}} install --dir ./skills    # any directory
+uvx {{DIST}} install --dry-run         # preview
+uvx {{DIST}} install --force           # overwrite existing copies
+uvx {{DIST}} uninstall                 # remove them again
+uvx {{DIST}} list                      # list the bundled skills
+```
+
+## Skills
+
+{{SKILLS}}

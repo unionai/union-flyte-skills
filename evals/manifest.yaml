@@ -1,0 +1,4 @@
+# Cross-cutting config for the skill eval harness. Each scenario file names
+# its own skill; this holds where skills and scenarios live.
+scenarios_dir: evals/scenarios
+skill_dir_template: "plugins/union/skills/{skill}"
