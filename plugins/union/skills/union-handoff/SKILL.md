@@ -15,8 +15,20 @@ Run it with the skill directory as the base, for example
 `python3 <skill-dir>/scripts/handoff.py discover`.
 
 Follow the steps in order. **Copy nothing before step 3's report has been
-shown and the user has answered steps 4 and 5.** Ask one question at a time
-and wait for the answer.
+shown and the user has answered steps 4 and 5.**
+
+**Ask every question with your harness's question tool**, not as a list in
+your reply: in Claude Code that is `AskUserQuestion`, and other harnesses
+have their own (Codex's `request_user_input`, for example). Give it the
+choices as options, with the recommended one first and a one-line
+description each, and use multi-select where several can apply (which
+sessions to move, which credentials to copy). Only when the harness has no
+such tool, ask in plain text, one question at a time, and wait for the answer.
+
+The questions, in order: which sessions (step 2); per repo with unpushed or
+uncommitted work, push first or ship in the volume, and per credential, copy
+or not (step 3); which harness (step 4); memory per session (step 5); and
+the go-ahead before sealing (step 6).
 
 ## 1. Discover
 
