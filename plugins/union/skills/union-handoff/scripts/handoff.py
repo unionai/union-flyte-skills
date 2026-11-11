@@ -324,7 +324,21 @@ else:
     flyte.init_from_config(project=a["project"], domain=a["domain"])
 task = r.Task.get(a["task"], project=a["project"], domain=a["domain"], auto_version="latest")
 run = flyte.run(task, identifier=a["identifier"], home_locator=a["locator"])
-print(json.dumps({"run": run.name, "url": run.url}))
+# The launcher admits or refuses the agent (a login already in use, an
+# agent already on) early in its run; wait that long for the verdict. A run
+# still going after that is the agent, on.
+import time
+verdict, error = "on", ""
+deadline = time.time() + a["wait"]
+while time.time() < deadline:
+    details = r.ActionDetails.get(run_name=run.name, name="a0")
+    phase = details.pb2.status.phase
+    if phase >= 5:  # finished before the agent came up: refused or failed
+        verdict = "refused"
+        error = details.pb2.error_info.message if details.pb2.HasField("error_info") else f"phase {phase}"
+        break
+    time.sleep(10)
+print(json.dumps({"run": run.name, "url": run.url, "verdict": verdict, "error": error}))
 """
 
 
@@ -345,7 +359,8 @@ def flyte_python(flyte_cli: str) -> str:
 
 def launch_command(args) -> list[str]:
     payload = {"task": args.launcher_task, "project": args.project, "domain": args.domain,
-               "identifier": args.identifier, "locator": args.locator, "config": args.config}
+               "identifier": args.identifier, "locator": args.locator, "config": args.config,
+               "wait": args.wait}
     return [args.python or flyte_python(args.flyte), "-c", LAUNCH_SNIPPET, json.dumps(payload)]
 
 
@@ -370,9 +385,15 @@ def cmd_launch(args) -> int:
         elif "No module named 'flyte'" in out:
             print("flyte-sdk is not importable there; pass --python <interpreter with flyte installed>.", file=sys.stderr)
         return proc.returncode
-    started = json.loads(proc.stdout.strip().splitlines()[-1])
-    print(json.dumps(started))
-    print(f"Started agent {args.identifier!r} (run {started['run']}). Its sessions wait under Done; "
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    print(json.dumps(result))
+    if result["verdict"] == "refused":
+        print(f"Union refused to start {args.identifier!r}: {result['error']}", file=sys.stderr)
+        if "already in use" in result["error"]:
+            print("Give this agent a login of its own (see the skill), then launch again with the same identifier.",
+                  file=sys.stderr)
+        return 1
+    print(f"Agent {args.identifier!r} is starting (run {result['run']}). Its sessions wait under Done; "
           "Restart resumes each one.", file=sys.stderr)
     return 0
 
@@ -437,6 +458,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="flyte config file (default: flyte's own lookup)")
     p.add_argument("--flyte", default="flyte", help="the flyte CLI whose Python to use")
     p.add_argument("--python", help="a Python with flyte-sdk installed (default: the flyte CLI's)")
+    p.add_argument("--wait", type=int, default=180, help="seconds to wait for Union to admit or refuse it (default: 180)")
     p.add_argument("--dry-run", action="store_true", help="say what would be launched, launch nothing")
     p.set_defaults(func=cmd_launch)
     return ap

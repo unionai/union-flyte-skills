@@ -991,7 +991,8 @@ def _fake_python(tmp_path: Path, body: str) -> Path:
 
 
 def test_launch_uses_the_python_api(machine, tmp_path):
-    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\necho \'{"run": "r123", "url": "https://x/r123"}\'\n')
+    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\n'
+                      'echo \'{"run": "r123", "url": "https://x/r123", "verdict": "on", "error": ""}\'\n')
     args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent", "--python", str(py)]
     dry = run_cli(machine, *args, "--dry-run")
     assert dry.returncode == 0 and "agent-workspace-launcher.launch_agent_workspace in system/production" in dry.stdout
@@ -1002,7 +1003,7 @@ def test_launch_uses_the_python_api(machine, tmp_path):
     payload = json.loads(Path(str(py) + ".payload").read_text())
     assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": "system",
                        "domain": "production", "identifier": "my-agent",
-                       "locator": "s3://b/v/x.metadata.json", "config": None}
+                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180}
 
 
 def test_launch_snippet_is_valid_python():
@@ -1022,3 +1023,11 @@ def test_launch_explains_an_agent_that_is_on(machine, tmp_path):
     py = _fake_python(tmp_path, "echo 'AgentAlreadyOn: my-agent is on' >&2\nexit 1\n")
     proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "my-agent", "--python", str(py))
     assert proc.returncode == 1 and "Turn it off first" in proc.stderr
+
+
+def test_launch_reports_a_refusal(machine, tmp_path):
+    msg = "Secret 'me-claude-session' is already in use by agent 'me'. turn that one off first"
+    py = _fake_python(tmp_path, "echo '" + json.dumps({"run": "r1", "url": "u", "verdict": "refused", "error": msg}) + "'\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "a", "--python", str(py))
+    assert proc.returncode == 1
+    assert "Union refused to start 'a'" in proc.stderr and "login of its own" in proc.stderr
