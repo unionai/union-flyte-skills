@@ -157,7 +157,7 @@ class Repo:
     tracked_secret_files: list[str] = field(default_factory=list)  # already committed: they travel in history
     submodules: int = 0
     worktree: bool = False  # a linked worktree (its .git is a file pointing elsewhere)
-    secrets_in_patch: dict = field(default_factory=dict)
+    flagged_in_patch: dict = field(default_factory=dict)
     sessions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -237,7 +237,7 @@ def describe_repo(path: Path) -> Repo:
     staged = subprocess.run(["git", "-C", str(top), "diff", "--cached", "--binary"], capture_output=True).stdout
     unstaged = subprocess.run(["git", "-C", str(top), "diff", "--binary"], capture_output=True).stdout
     r.patch_bytes = len(staged) + len(unstaged)
-    r.secrets_in_patch = scan_secret_values((staged + b"\n" + unstaged).decode(errors="replace").splitlines())
+    r.flagged_in_patch = scan_secret_values((staged + b"\n" + unstaged).decode(errors="replace").splitlines())
     common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common:
         r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())

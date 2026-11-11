@@ -8,7 +8,7 @@
   ~/code/infra      git repo on main, clean
   sessions          one per harness: claude (in webapp, also edits infra),
                     codex (in infra), pi, opencode (SQLite), hermes (SQLite)
-  credentials       gh, aws, a Claude login; each holds a FAKE_SECRET value
+  credentials       gh, aws, a Claude login; each holds a CANARY value
                     that must never appear in any output
   claude extras     ~/.claude/CLAUDE.md, a project memory, a user skill
 
@@ -24,7 +24,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-FAKE_SECRET = "FAKE_SECRET_9f8e7d6c5b4a"
+CANARY = "CANARY_9f8e7d6c5b4a"
 CLAUDE_ID = "11111111-2222-4333-8444-555555555555"
 CODEX_ID = "019a0000-aaaa-7bbb-8ccc-dddddddddddd"
 PI_ID = "pi-session-0001"
@@ -37,7 +37,7 @@ ENV = {
     "GIT_AUTHOR_EMAIL": "fixture@example.com",
     "GIT_COMMITTER_NAME": "Fixture",
     "GIT_COMMITTER_EMAIL": "fixture@example.com",
-    "MY_SERVICE_API_KEY": FAKE_SECRET,
+    "MY_SERVICE_API_KEY": CANARY,
 }
 
 
@@ -79,7 +79,7 @@ def build(root: Path) -> dict:
     _git(webapp, "add", "README.md")  # staged
     (webapp / "app.py").write_text("print('v2, unstaged')\n")  # unstaged
     (webapp / "notes.txt").write_text("untracked notes\n")
-    (webapp / ".env").write_text(f"API_KEY={FAKE_SECRET}\n")
+    (webapp / ".env").write_text(f"API_KEY={CANARY}\n")
     infra = _repo(home, "infra", "main")
 
     # Claude Code: a session in webapp that also edits infra.
@@ -116,7 +116,7 @@ def build(root: Path) -> dict:
     skill = home / ".claude" / "skills" / "my-skill"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text("---\nname: my-skill\ndescription: A user skill from the fixture.\n---\nHello.\n")
-    (home / ".claude" / ".credentials.json").write_text(json.dumps({"token": FAKE_SECRET}))
+    (home / ".claude" / ".credentials.json").write_text(json.dumps({"token": CANARY}))
 
     # Codex: a session in infra.
     codex_file = home / ".codex" / "sessions" / "2026" / "11" / "02" / f"rollout-2026-11-02T09-00-00-{CODEX_ID}.jsonl"
@@ -184,9 +184,9 @@ def build(root: Path) -> dict:
 
     # Credentials, each holding the fake secret.
     (home / ".config" / "gh").mkdir(parents=True)
-    (home / ".config" / "gh" / "hosts.yml").write_text(f"github.com:\n  oauth_token: {FAKE_SECRET}\n")
+    (home / ".config" / "gh" / "hosts.yml").write_text(f"github.com:\n  oauth_token: {CANARY}\n")
     (home / ".aws").mkdir()
-    (home / ".aws" / "credentials").write_text(f"[default]\naws_secret_access_key = {FAKE_SECRET}\n")
+    (home / ".aws" / "credentials").write_text(f"[default]\naws_secret_access_key = {CANARY}\n")
 
     return {
         "home": home,
@@ -198,5 +198,5 @@ def build(root: Path) -> dict:
         "pi": f"pi:{PI_ID}",
         "opencode": f"opencode:{OPENCODE_ID}",
         "hermes": f"hermes:{HERMES_ID}",
-        "secret": FAKE_SECRET,
+        "canary": CANARY,
     }

@@ -10,7 +10,7 @@ args: [report, --json, --session, "{claude}", --session, "{codex}", --session, "
        --session, "{opencode}", --session, "{hermes}"]
 checks:
   - kind: exit_code
-  - {kind: not_regex, name: no secret value printed, pattern: "{secret}"}
+  - {kind: not_regex, name: no secret value printed, pattern: "{canary}"}
   # Repos, including one reached only through an edit outside the cwd.
   - {kind: json_contains, path: "repos[*].path", item: "{webapp}"}
   - {kind: json_contains, path: "repos[*].path", item: "{infra}"}
@@ -38,4 +38,4 @@ checks:
   - {kind: json_equals, path: "sessions[2].remote_harness", equals: claude}
   - {kind: json_min, path: "totals.total_bytes_estimate", min: 1}
   # Every session is scanned for credential-looking values; the fixture has none.
-  - {kind: json_equals, path: "sessions[0].secrets_in_transcript", equals: {}}
+  - {kind: json_equals, path: "sessions[0].flagged_in_transcript", equals: {}}

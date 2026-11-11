@@ -123,7 +123,7 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None,
             "commands": len(p.commands),
             "first_request": inv.redact_values(hz._short(p.first_user, 200)),
             "last_request": inv.redact_values(hz._short(p.last_user, 200)),
-            "secrets_in_transcript": stg.transcript_secrets(s),
+            "flagged_in_transcript": stg.transcript_secrets(s),
             "remote_harness": target,
             "arrives": "resumable" if resumable else "handoff note",
         })
@@ -157,8 +157,8 @@ def print_report(rep: dict) -> None:
         if s["title"]:
             print(f"    title: {s['title']}")
         print(f"    shell commands run: {s['commands']}")
-        if s["secrets_in_transcript"]:
-            kinds = ", ".join(f"{n} {k}" for k, n in s["secrets_in_transcript"].items())
+        if s["flagged_in_transcript"]:
+            kinds = ", ".join(f"{n} {k}" for k, n in s["flagged_in_transcript"].items())
             print(f"    WARNING: the transcript holds credential-looking values ({kinds}).")
             print("      A transcript is copied whole; rotate them or leave this session out.")
     print("\nREPOS")
@@ -179,8 +179,8 @@ def print_report(rep: dict) -> None:
                 print(f"    secret-looking untracked files, left behind unless picked: {', '.join(r['secret_files'])}")
             if r["tracked_secret_files"]:
                 print(f"    WARNING: committed files that look like secrets travel in the history: {', '.join(r['tracked_secret_files'])}")
-            if r["secrets_in_patch"]:
-                kinds = ", ".join(f"{n} {k}" for k, n in r["secrets_in_patch"].items())
+            if r["flagged_in_patch"]:
+                kinds = ", ".join(f"{n} {k}" for k, n in r["flagged_in_patch"].items())
                 print(f"    WARNING: the uncommitted changes hold credential-looking values ({kinds})")
             if r["submodules"]:
                 print(f"    {r['submodules']} submodule(s): not followed; the agent re-clones them with `git submodule update --init`")

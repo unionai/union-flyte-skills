@@ -110,7 +110,7 @@ def test_command_names():
 def test_report_cli(machine):
     proc = run_cli(machine, "report", "--json", "--session", machine["claude"], "--session", machine["codex"], "--session", machine["pi"])
     assert proc.returncode == 0, proc.stderr
-    assert world.FAKE_SECRET not in proc.stdout + proc.stderr
+    assert world.CANARY not in proc.stdout + proc.stderr
     rep = json.loads(proc.stdout)
     repos = {r["path"]: r for r in rep["repos"]}
     web = repos[str(machine["webapp"])]
@@ -135,7 +135,7 @@ def test_report_cli(machine):
 def test_report_text_never_prints_secrets(machine):
     proc = run_cli(machine, "report", *sum((["--session", machine[h]] for h in ("claude", "codex", "pi", "opencode", "hermes")), []))
     assert proc.returncode == 0, proc.stderr
-    assert world.FAKE_SECRET not in proc.stdout + proc.stderr
+    assert world.CANARY not in proc.stdout + proc.stderr
     for heading in ("SESSIONS", "REPOS", "TOOLS", "CREDENTIALS", "SIZE"):
         assert heading in proc.stdout
 
@@ -240,7 +240,7 @@ def test_stage_for_claude(machine, tmp_path):
     assert not (home / ".config/gh").exists() and not (home / ".aws").exists()
     assert not (home / ".claude/.credentials.json").exists()
     staged_text = "".join(f.read_text(errors="replace") for f in home.rglob("*") if f.is_file() and ".git/" not in str(f))
-    assert world.FAKE_SECRET not in staged_text
+    assert world.CANARY not in staged_text
 
 
 def test_stage_copies_only_picked_credentials(machine, tmp_path):
@@ -435,16 +435,16 @@ def test_non_git_cwd_and_empty_repo_travel_as_trees(machine, tmp_path):
 
 def test_every_copy_path_leaves_unpicked_secrets_behind(machine, tmp_path):
     web = Path(machine["webapp"])
-    (web / ".npmrc").write_text(f"//registry/:_authToken={world.FAKE_SECRET}\n")
-    (web / "id_ed25519").write_text(world.FAKE_SECRET)
+    (web / ".npmrc").write_text(f"//registry/:_authToken={world.CANARY}\n")
+    (web / "id_ed25519").write_text(world.CANARY)
     plain = Path(machine["home"]) / "notes"
     plain.mkdir()
-    (plain / ".env").write_text(world.FAKE_SECRET)
+    (plain / ".env").write_text(world.CANARY)
     (plain / "todo.md").write_text("x")
     skill = Path(machine["home"]) / ".claude/skills/my-skill"
     (skill / "login.json").symlink_to(Path(machine["home"]) / ".claude/.credentials.json")
     mem = next(Path(machine["home"]).glob(".claude/projects/*/memory"))
-    (mem / "token.json").write_text(world.FAKE_SECRET)
+    (mem / "token.json").write_text(world.CANARY)
     t = tmp_path / "t.jsonl"
     t.write_text("{}\n")
     pool = hz.discover()
@@ -458,7 +458,7 @@ def test_every_copy_path_leaves_unpicked_secrets_behind(machine, tmp_path):
     assert (home / ".claude/skills/my-skill/SKILL.md").exists()
     assert not list(home.rglob("token.json"))
     everything = b"".join(f.read_bytes() for f in home.rglob("*") if f.is_file())
-    assert world.FAKE_SECRET.encode() not in everything
+    assert world.CANARY.encode() not in everything
     assert m["extras"]["left_behind"]
 
 
@@ -473,7 +473,7 @@ def test_secrets_in_a_transcript_stop_staging(machine, tmp_path):
     assert "GitHub token" in str(e.value) and token not in str(e.value)
     assert not (tmp_path / "o" / "home").exists()
     rep = __import__("handoff").build_report([s], None)
-    assert rep["sessions"][0]["secrets_in_transcript"] == {"GitHub token": 1}
+    assert rep["sessions"][0]["flagged_in_transcript"] == {"GitHub token": 1}
     assert token not in json.dumps(rep)
     stg.stage([s], stg.StageOptions(out=tmp_path / "o2", remote_harness="claude", allow_transcript_secrets=True, log=lambda x: None))
 
@@ -481,11 +481,11 @@ def test_secrets_in_a_transcript_stop_staging(machine, tmp_path):
 def test_remote_url_credentials_are_redacted(machine, tmp_path):
     web = Path(machine["webapp"])
     subprocess.run(["git", "-C", str(web), "remote", "set-url", "origin",
-                    f"https://bob:{world.FAKE_SECRET}@github.com/example/webapp.git"], check=True)
+                    f"https://bob:{world.CANARY}@github.com/example/webapp.git"], check=True)
     proc = run_cli(machine, "report", "--session", machine["claude"])
-    assert world.FAKE_SECRET not in proc.stdout and "https://github.com/example/webapp.git" in proc.stdout
+    assert world.CANARY not in proc.stdout and "https://github.com/example/webapp.git" in proc.stdout
     home, _ = stage_all(machine, tmp_path, "claude")
-    assert world.FAKE_SECRET not in (home / "src/webapp/.git/config").read_text()
+    assert world.CANARY not in (home / "src/webapp/.git/config").read_text()
 
 
 def test_bundle_with_default_branch_main(machine, tmp_path, monkeypatch):
@@ -635,16 +635,16 @@ def test_interrupted_copy_leaves_the_mount_unpublished(machine, tmp_path, monkey
 def test_secret_directories_are_left_behind(machine, tmp_path):
     plain = Path(machine["home"]) / "ops"
     (plain / ".kube").mkdir(parents=True)
-    (plain / ".kube" / "config").write_text(world.FAKE_SECRET)
+    (plain / ".kube" / "config").write_text(world.CANARY)
     (plain / "gh").mkdir()
-    (plain / "gh" / "hosts.yml").write_text(world.FAKE_SECRET)
+    (plain / "gh" / "hosts.yml").write_text(world.CANARY)
     (plain / "README.md").write_text("ops")
     t = tmp_path / "t.jsonl"
     t.write_text("{}\n")
     out = tmp_path / "o"
     stg.stage([hz.find(f"file:{t}@{plain}")], stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
     assert (out / "home/src/ops/README.md").exists()
-    assert world.FAKE_SECRET.encode() not in b"".join(f.read_bytes() for f in (out / "home").rglob("*") if f.is_file())
+    assert world.CANARY.encode() not in b"".join(f.read_bytes() for f in (out / "home").rglob("*") if f.is_file())
 
 
 def test_staged_secret_reverted_in_worktree_is_caught(machine, tmp_path):
@@ -656,7 +656,7 @@ def test_staged_secret_reverted_in_worktree_is_caught(machine, tmp_path):
         stage_all(machine, tmp_path, "claude")
     assert "GitHub token" in str(e.value)
     rep = __import__("handoff").build_report([hz.find(machine["claude"])], None)
-    assert any(r["secrets_in_patch"] for r in rep["repos"])
+    assert any(r["flagged_in_patch"] for r in rep["repos"])
 
 
 def test_redaction_happens_before_truncation():
@@ -676,7 +676,7 @@ def test_tree_copy_drops_url_credentials_and_nested_worktree_pointers(machine, t
     (nested / ".git").write_text("gitdir: /old/machine/.git/worktrees/wt\n")
     empty = Path(machine["home"]) / "fresh"
     subprocess.run(["git", "init", "-q", str(empty)], check=True)
-    subprocess.run(["git", "-C", str(empty), "remote", "add", "origin", f"https://bob:{world.FAKE_SECRET}@example.com/r.git"], check=True)
+    subprocess.run(["git", "-C", str(empty), "remote", "add", "origin", f"https://bob:{world.CANARY}@example.com/r.git"], check=True)
     ts = []
     for d in (plain, empty):
         t = tmp_path / f"{d.name}.jsonl"
@@ -685,7 +685,7 @@ def test_tree_copy_drops_url_credentials_and_nested_worktree_pointers(machine, t
     out = tmp_path / "o"
     stg.stage(ts, stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
     assert not (out / "home/src/plain/wt/.git").exists()
-    assert world.FAKE_SECRET not in (out / "home/src/fresh/.git/config").read_text()
+    assert world.CANARY not in (out / "home/src/fresh/.git/config").read_text()
 
 
 def test_temp_branch_never_collides(machine, tmp_path):

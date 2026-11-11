@@ -8,7 +8,7 @@ script: scripts/handoff.py
 args: [report, --session, "{claude}", --session, "{codex}"]
 checks:
   - kind: exit_code
-  - {kind: not_regex, name: no secret value printed, pattern: "{secret}"}
+  - {kind: not_regex, name: no secret value printed, pattern: "{canary}"}
   - {kind: stdout_regex, pattern: "^SESSIONS"}
   - {kind: stdout_regex, pattern: "^REPOS"}
   - {kind: stdout_regex, pattern: "binaries are never copied"}
