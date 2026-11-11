@@ -357,6 +357,16 @@ need() {  # need <binary> <install command...>
   eval "$@" || echo "FAILED $bin" >&2
 }
 
+# Files copied from another machine keep that machine's user id, and git
+# refuses to work in a repo owned by someone else ("dubious ownership").
+for repo in "$HOME"/src/*/; do
+  [ -d "$repo" ] || continue
+  if [ "$(stat -c %u "$repo")" != "$(id -u)" ]; then
+    chown -R "$(id -u):$(id -g)" "$repo" 2>/dev/null \
+      || git config --global --add safe.directory "${repo%/}"
+  fi
+done
+
 if have apt-get && [ "$(id -u)" = 0 ]; then apt-get update -qq || true; fi
 """
 
