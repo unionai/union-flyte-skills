@@ -134,7 +134,12 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None,
     transcripts = sum(s.size_bytes for s in sessions)
     repo_bytes = 0
     for r in repos:
-        repo_bytes += (r.history_bytes + r.patch_bytes + r.untracked_bytes) if (r.git and r.head) else r.tree_bytes
+        if r.plan == "reference":
+            repo_bytes += r.patch_bytes + r.untracked_bytes  # plus a small bundle of the unpushed commits
+        elif r.git and r.head:
+            repo_bytes += r.history_bytes + r.patch_bytes + r.untracked_bytes
+        else:
+            repo_bytes += r.tree_bytes
     return {
         "sessions": session_rows,
         "repos": [r.to_dict() for r in repos],
@@ -169,12 +174,17 @@ def print_report(rep: dict) -> None:
             print(f"  {r['path']}  (git, no commits yet)  travels as: full tree, {human(r['tree_bytes'])}")
         elif r["git"]:
             print(f"  {r['path']}  branch {r['branch']}  remote {r['remote'] or '(none)'}")
-            print(f"    travels as: git bundle of {len(r['branches'])} local branch(es), remote-tracking branches and tags,"
-                  f" up to {human(r['history_bytes'])} of history")
+            if r["plan"] == "reference":
+                print(f"    travels by reference: re-cloned from {r['clone_url']} when the agent first boots;")
+                print("      only what the remote lacks is shipped (the commits below, the changes, untracked files).")
+                print("      The agent needs read access to that remote; ship it whole instead with --ship <repo>.")
+            else:
+                print(f"    travels as: git bundle of {len(r['branches'])} local branch(es), remote-tracking branches and tags,"
+                      f" up to {human(r['history_bytes'])} of history (no remote to re-clone from)")
             print(f"    uncommitted: {r['modified_files']} modified file(s), patch {human(r['patch_bytes'])};"
                   f" {r['untracked_files']} untracked file(s), {human(r['untracked_bytes'])}")
             if r["unpushed_commits"]:
-                print(f"    {r['unpushed_commits']} commit(s) not pushed (they travel in the bundle)")
+                print(f"    {r['unpushed_commits']} commit(s) not on the remote: push them first, or they travel in a bundle")
             if r["secret_files"]:
                 print(f"    secret-looking untracked files, left behind unless picked: {', '.join(r['secret_files'])}")
             if r["tracked_secret_files"]:
@@ -242,6 +252,9 @@ def cmd_stage(args) -> int:
         remote_home=args.remote_home,
         credentials=set(args.credential or []),
         tree_repos={str(Path(p).expanduser().resolve()) for p in args.tree or []},
+        ship_repos={str(Path(p).expanduser().resolve()) for p in args.ship or []},
+        memory=args.memory,
+        cpu=args.cpu,
         exclude_repos={str(Path(p).expanduser().resolve()) for p in args.exclude or []},
         include_dirs={str(Path(p).expanduser().resolve()) for p in args.include or []},
         allow_transcript_secrets=args.allow_transcript_secrets,
@@ -305,6 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-home", default="/root", help="the agent's home directory (default: /root)")
     p.add_argument("--credential", action="append", help="credential id from the report to copy (repeatable)")
     p.add_argument("--tree", action="append", help="copy this repo as a full tree instead of a bundle")
+    p.add_argument("--ship", action="append", help="ship this repo's whole history instead of re-cloning it on first boot")
+    p.add_argument("--memory", default="2Gi", help="memory for each restored session (default: 2Gi)")
+    p.add_argument("--cpu", default="2", help="CPUs for each restored session (default: 2)")
     p.add_argument("--exclude", action="append", help="leave this repo behind")
     p.add_argument("--include", action="append", help="also move this repo or directory")
     p.add_argument("--allow-transcript-secrets", action="store_true",

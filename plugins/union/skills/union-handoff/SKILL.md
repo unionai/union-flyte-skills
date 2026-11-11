@@ -52,17 +52,31 @@ python3 scripts/handoff.py report --session claude:<id> [--session ...]
 Show the user the whole report, in your own words where it helps. It covers:
 
 - **Repos.** Every git repo the sessions worked in (their working directory,
-  plus any repo their tools edited). A repo travels as a **git bundle** of its
-  history (local branches, remote-tracking branches, tags) plus its
-  **uncommitted work** (staged and unstaged changes, untracked files). A
-  directory that is not a git repo travels as a **full tree**, without
-  `node_modules`, virtualenvs and build output. Offer `--tree <repo>` for a git
-  repo the user wants copied as-is, `--exclude <repo>` to leave one behind, and
+  plus any repo their tools edited), with its branch and worktrees. A repo
+  with a remote travels **by reference**: the agent re-clones it from that
+  remote when it first boots, recreates its worktrees, and checks out the same
+  branch. Only what the remote does not have is shipped: commits not pushed
+  yet (as a small bundle), staged and unstaged changes, and untracked files.
+  A repo with no remote travels as a **git bundle** of its whole history plus
+  that uncommitted work. A directory that is not a git repo travels as a
+  **full tree**, without `node_modules`, virtualenvs and build output. Offer
+  `--ship <repo>` to send a repo's whole history instead of re-cloning it,
+  `--tree <repo>` for one the user wants copied as-is, `--exclude <repo>` to
+  leave one behind, and
   `--include <dir>` for a repo the sessions used that the report missed (the
   script finds repos from working directories, file tools and `cd`/`git -C` in
   shell commands, but a script can reach a repo in ways it cannot see). Pass
   the same flags to `report` again to see the result.
 - **Transcripts** and their sizes, and an estimated **total**.
+
+For each repo with **unpushed commits or uncommitted changes**, ask the user
+which they prefer: push them to the remote now (they, or you with their
+explicit go-ahead, run `git push`; uncommitted work needs committing first),
+or let them travel in the volume. Pushing keeps the volume small and the
+work safe on the remote; shipping keeps it private until they push it.
+A repo that travels by reference needs **read access to its remote from the
+agent**: copy the GitHub CLI login (step below) or plan to sign in there
+before running the setup script.
 - **Tools** the sessions ran, counted from their shell commands, with how each
   was installed locally (brew, npm, pip/uv, cargo) and the Linux line that
   installs it in the agent. **Binaries are never copied**: a macOS binary does
@@ -125,6 +139,10 @@ sealed volume laid out as an agent home, ready for when that lands. Then ask:
   will not use this version until Union supports it (step 7). Ask for the
   agent home's artifact name.
 
+Also ask how much **memory** each restored session should get (default
+`2Gi`; pass `--memory`, and `--cpu` for CPUs, default 2). It is recorded with
+each session and used when it is restarted.
+
 ## 6. Stage, review, seal
 
 Stage into a new local directory first, so the user can look before anything
@@ -133,7 +151,8 @@ leaves the machine:
 ```bash
 python3 scripts/handoff.py stage --out ~/union-handoff/<name> \
   --remote-harness claude --session claude:<id> [--session ...] \
-  [--credential <id> ...] [--tree <repo>] [--exclude <repo>]
+  [--credential <id> ...] [--ship <repo>] [--tree <repo>] [--exclude <repo>] \
+  [--memory 2Gi] [--cpu 2]
 ```
 
 Then, before sealing:
@@ -198,8 +217,11 @@ Once an agent can run on this home, each session is found as follows:
   left off, in its repo under `src/`.
 - **Written handoffs** are in `~/handoff/<session>/` inside the agent. Start a
   new session and ask it to read `~/handoff/<session>/HANDOFF.md` first.
-- On first boot, run `bash ~/.handoff/setup.sh` once (the home's `CLAUDE.md` or
-  `AGENTS.md` tells the agent to).
+- On first boot, run `bash ~/.handoff/setup.sh` once, **before restarting any
+  session** (the home's `CLAUDE.md` or `AGENTS.md` tells the agent to). It
+  re-clones the repos that travelled by reference and reapplies their local
+  work, then installs the tools. A clone that fails usually means the agent
+  is not signed in to the git host yet: sign in and run it again.
 - Credentials that were not copied need a fresh sign-in inside the agent.
 
 What lands where in the agent's home, and why, is in

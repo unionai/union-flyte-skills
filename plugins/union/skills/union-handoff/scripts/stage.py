@@ -216,6 +216,57 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
     }
 
 
+def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[str],
+                        worktree_of: Optional[str]) -> dict:
+    """Record a repo to be re-cloned from its remote on first boot, and ship
+    only what the remote lacks: the commits after the remote base (a small
+    bundle), the staged and unstaged patches, and the untracked files.
+    ~/.handoff/restore_repos.py puts it back together."""
+    upstream, url, base = inv.remote_base(src)
+    branch = inv._git(src, "symbolic-ref", "--quiet", "--short", "HEAD") or None
+    head = inv._git(src, "rev-parse", "HEAD", check=True)
+    meta.mkdir(parents=True)
+    bundle_bytes = 0
+    if base != head:
+        bundle = meta / "unpushed.bundle"
+        _run(["git", "-C", str(src), "bundle", "create", str(bundle), "HEAD", f"^{base}"])
+        bundle_bytes = bundle.stat().st_size
+    staged = subprocess.run(["git", "-C", str(src), "diff", "--cached", "--binary"], capture_output=True).stdout
+    unstaged = subprocess.run(["git", "-C", str(src), "diff", "--binary"], capture_output=True).stdout
+    for name, patch in (("staged.patch", staged), ("unstaged.patch", unstaged)):
+        if patch.strip():
+            (meta / name).write_bytes(patch)
+    copied, skipped = [], []
+    for rel in inv.untracked(src):
+        s, d = src / rel, meta / "untracked" / rel
+        if inv.is_secret_path(rel) and str(s) not in picked_files:
+            skipped.append(rel)
+            continue
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if s.is_symlink():
+            os.symlink(os.readlink(s), d)
+        elif s.is_file():
+            shutil.copy2(s, d)
+        else:
+            continue
+        copied.append(rel)
+    spec = {"path": rel_dest, "url": url, "branch": branch, "head": head, "base": base,
+            "upstream": upstream, "worktree_of": worktree_of}
+    (meta / "repo.json").write_text(json.dumps(spec, indent=1) + "\n")
+    return {
+        "mode": "reference",
+        "clone_url": url,
+        "branch": branch,
+        "head": head,
+        "worktree_of": worktree_of,
+        "unpushed_commits": int(inv._git(src, "rev-list", "--count", f"{base}..HEAD") or 0),
+        "bundle_bytes": bundle_bytes,
+        "patch_bytes": len(staged) + len(unstaged),
+        "untracked_copied": len(copied),
+        "secret_files_left_behind": skipped,
+    }
+
+
 _CONFIG_USERINFO_RE = re.compile(r"(url\s*=\s*[a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
 
 
@@ -448,8 +499,15 @@ if have apt-get && [ "$(id -u)" = 0 ]; then apt-get update -qq || true; fi
 """
 
 
-def setup_script(tools: list[inv.Tool]) -> str:
+def setup_script(tools: list[inv.Tool], restore_repos: bool = False) -> str:
     lines = [SETUP_HEADER]
+    if restore_repos:
+        lines += [
+            "# Re-clone the repos that travelled by reference and reapply their",
+            "# local work. Needs git access to their hosts (sign in first).",
+            'python3 "$HOME/.handoff/restore_repos.py" || FAILED="$FAILED repos"',
+            "",
+        ]
     todo = []
     for t in tools:
         line = t.linux_install
@@ -534,6 +592,7 @@ class StageOptions:
     remote_home: str = "/root"
     credentials: set[str] = field(default_factory=set)
     tree_repos: set[str] = field(default_factory=set)
+    ship_repos: set[str] = field(default_factory=set)  # bundle the whole history instead of re-cloning
     exclude_repos: set[str] = field(default_factory=set)
     include_dirs: set[str] = field(default_factory=set)
     allow_transcript_secrets: bool = False
@@ -613,11 +672,41 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         pm.add(str(top), f"{rh}/src/{name}")
     pm.add(str(local_home), rh)
 
+    # Worktrees of one repo: the main checkout is cloned, the others are added
+    # to it as worktrees, as they were here.
+    primary_of: dict[str, Optional[str]] = {}
+    groups: dict[str, list[Path]] = {}
+    for top in repo_paths:
+        if inv.is_git(top):
+            common = inv._git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
+            groups.setdefault(common or str(top), []).append(top)
+    for members in groups.values():
+        main = next((m for m in members if (m / ".git").is_dir()), members[0])
+        for m in members:
+            primary_of[str(m)] = None if m == main else remote_of[str(main)][len(rh) + 1:]
+
+    by_reference = {
+        str(top): (inv.is_git(top) and inv.has_commits(top) and str(top) not in opts.ship_repos
+                   and str(top) not in opts.tree_repos and all(inv.remote_base(top)[1:]))
+        for top in repo_paths
+    }
+    main_path = {remote_of[str(t)][len(rh) + 1:]: str(t) for t in repo_paths}
+
     repos: dict[str, dict] = {}
     for top in repo_paths:
-        dest = home / remote_of[str(top)][len(rh) + 1:]
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        rel_dest = remote_of[str(top)][len(rh) + 1:]
+        dest = home / rel_dest
         is_git = inv.is_git(top)
+        if by_reference[str(top)]:
+            primary = primary_of.get(str(top))
+            if primary and not by_reference[main_path[primary]]:
+                primary = None  # its main checkout travels whole, so clone this one on its own
+            opts.log(f"repo  {top} -> {remote_of[str(top)]} (re-cloned on first boot)")
+            info = stage_git_reference(top, rel_dest, home / ".handoff" / "repos" / dest.name, picked_files, primary)
+            info["remote"] = remote_of[str(top)]
+            repos[str(top)] = info
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
         as_tree = str(top) in opts.tree_repos
         if as_tree and (top / ".git").is_file():
             # A linked worktree's .git points at the old machine; a copied tree
@@ -720,7 +809,10 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     # 5. Setup script, finished records, notes.
     hdir = home / ".handoff"
     hdir.mkdir(exist_ok=True)
-    (hdir / "setup.sh").write_text(setup_script(tools_all))
+    restores = any(r.get("mode") == "reference" for r in repos.values())
+    if restores:
+        shutil.copy2(Path(__file__).with_name("restore_repos.py"), hdir / "restore_repos.py")
+    (hdir / "setup.sh").write_text(setup_script(tools_all, restore_repos=restores))
     (hdir / "setup.sh").chmod(0o755)
 
     now = time.time()
