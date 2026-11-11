@@ -18,8 +18,8 @@ Follow the steps in order. **Copy nothing before step 3's report has been
 shown and the user has answered steps 4 and 5.**
 
 **Ask every question with your harness's question tool**, not as a list in
-your reply: in Claude Code that is `AskUserQuestion`, and other harnesses
-have their own (Codex's `request_user_input`, for example). Give it the
+your reply: in Claude Code that is `AskUserQuestion`; use the equivalent
+in other harnesses that have one. Give it the
 choices as options, with the recommended one first and a one-line
 description each, and use multi-select where several can apply (which
 sessions to move, which credentials to copy). Only when the harness has no
