@@ -154,9 +154,14 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
     bundle.parent.mkdir(parents=True, exist_ok=True)
     _run(["git", "-C", str(src), "bundle", "create", str(bundle), "--branches", "--tags", "--remotes", "HEAD"])
     _run(["git", "init", "--quiet", str(dest)])
-    # Point HEAD at a branch nobody has, so fetching into refs/heads/* cannot
-    # collide with the checked-out initial branch (main or master).
-    _run(["git", "-C", str(dest), "symbolic-ref", "HEAD", "refs/heads/union-handoff-unborn"])
+    # Point HEAD at a branch the bundle does not have, so fetching into
+    # refs/heads/* cannot collide with the checked-out initial branch.
+    heads = set(_run(["git", "bundle", "list-heads", str(bundle)]).stdout.split())
+    unborn, n = "refs/heads/union-handoff-unborn", 0
+    while unborn in heads:
+        n += 1
+        unborn = f"refs/heads/union-handoff-unborn-{n}"
+    _run(["git", "-C", str(dest), "symbolic-ref", "HEAD", unborn])
     _run(["git", "-C", str(dest), "fetch", "--quiet", str(bundle), "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "+refs/remotes/*:refs/remotes/*"])
 
     branch = inv._git(src, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -187,7 +192,7 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
     copied, skipped = [], []
     for rel in inv.untracked(src):
         s, d = src / rel, dest / rel
-        if inv.is_secret_file(Path(rel).name) and str(s) not in picked_files:
+        if inv.is_secret_path(rel) and str(s) not in picked_files:
             skipped.append(rel)
             continue
         d.parent.mkdir(parents=True, exist_ok=True)
@@ -211,6 +216,9 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
     }
 
 
+_CONFIG_USERINFO_RE = re.compile(r"(url\s*=\s*[a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
+
+
 def stage_tree(src: Path, dest: Path, picked_files: set[str]) -> dict:
     """Copy a directory as-is, without rebuildable dirs and without
     secret-looking files that were not picked."""
@@ -220,15 +228,26 @@ def stage_tree(src: Path, dest: Path, picked_files: set[str]) -> dict:
         out = []
         for n in names:
             full = os.path.join(d, n)
+            rel = os.path.relpath(full, src)
             if n in inv.SKIP_DIRS and n != ".git":
                 out.append(n)
-            elif inv.is_secret_file(n) and full not in picked_files:
+            elif n == ".git" and os.path.isfile(full):
+                # A nested worktree or submodule: its .git points at the old
+                # machine, so the copy is a plain directory instead.
                 out.append(n)
-                skipped.append(os.path.relpath(full, src))
+                skipped.append(rel)
+            elif inv.is_secret_path(rel) and full not in picked_files and not (n in inv.SECRET_DIRS and os.path.isdir(full) and any(
+                    p.startswith(full + os.sep) for p in picked_files)):
+                out.append(n)
+                skipped.append(rel)
         return out
 
     shutil.copytree(src, dest, symlinks=True, ignore=ignore)
-    return {"mode": "tree", "bytes": inv._dir_bytes(dest), "secret_files_left_behind": sorted(skipped)}
+    for cfg in [dest / ".git" / "config"] + list(dest.glob("**/.git/config")):
+        if cfg.is_file():  # remote URLs may embed user:token@
+            text = cfg.read_text(errors="surrogateescape")
+            cfg.write_text(_CONFIG_USERINFO_RE.sub(r"\1", text), errors="surrogateescape")
+    return {"mode": "tree", "bytes": inv._dir_bytes(dest, limit_files=None), "secret_files_left_behind": sorted(set(skipped))}
 
 
 # --------------------------------------------------------------------------- #
@@ -437,11 +456,12 @@ def setup_script(tools: list[inv.Tool]) -> str:
         if not line:
             continue
         if line.startswith("#"):
-            todo.append(f"{line}   (used {t.count}x)")
+            # Still checked: setup fails until this line is filled in or removed.
+            todo += [f"{line}   (used {t.count}x)", f"need {t.name} ':'"]
         else:
             lines.append(f"need {t.name} {_shq(line)}   # used {t.count}x, locally from {t.installed_by}")
     if todo:
-        lines += ["", "# Could not work these out; fill them in or delete them:"] + todo
+        lines += ["", "# Could not work these out; replace each ':' with an install command, or delete the pair:"] + todo
     lines += [
         "",
         'if [ -n "$FAILED" ]; then',
@@ -491,7 +511,8 @@ def validate_credentials(ids: set[str], repo_paths: list[Path], local_home: Path
     for cid in ids:
         if cid.startswith("file:"):
             p = Path(cid[len("file:"):])
-            if not (p.is_file() and inv.is_secret_file(p.name) and any(t in p.parents for t in repo_paths)):
+            top = next((t for t in repo_paths if t in p.parents), None)
+            if not (p.is_file() and top is not None and inv.is_secret_path(str(p.relative_to(top)))):
                 raise SystemExit(f"credential {cid!r} is not a secret-looking file inside a repo being moved")
             picked.add(str(p))
             continue
@@ -552,9 +573,27 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         top = inv.git_toplevel(Path(d)) or Path(d).resolve()
         if top not in repo_paths:
             repo_paths.append(top)
-    for top in repo_paths:
+    harness_dirs = [hz.claude_root(), hz.codex_root(), local_home / ".agents", hz.pi_root(), hz.hermes_root(),
+                    local_home / ".config" / "opencode"]
+    for top in repo_paths + harness_dirs:
         if out == top or top in out.parents:
-            raise SystemExit(f"--out {out} is inside {top}, which is being copied; stage somewhere else")
+            raise SystemExit(f"--out {out} is inside {top}, which is copied from; stage somewhere else")
+
+    # The uncommitted changes travel as patches; the same rule as transcripts.
+    for top in repo_paths:
+        if inv.is_git(top) and inv.has_commits(top):
+            patches = b"".join(subprocess.run(["git", "-C", str(top), "diff", *a, "--binary"], capture_output=True).stdout
+                               for a in (["--cached"], []))
+            kinds = inv.scan_secret_values(patches.decode(errors="replace").splitlines())
+            if kinds:
+                found[f"uncommitted changes in {top}"] = kinds
+    if found and not opts.allow_transcript_secrets:
+        lines = [f"  {k}: " + ", ".join(f"{n} {kind}" for kind, n in v.items()) for k, v in found.items()]
+        raise SystemExit(
+            "Uncommitted changes contain values that look like credentials, and they are copied as they are:\n"
+            + "\n".join(lines)
+            + "\nRevoke or rotate them, leave that repo out (--exclude), or pass --allow-transcript-secrets."
+        )
 
     picked_files = validate_credentials(opts.credentials, repo_paths, local_home)
     home = out / "home"
@@ -695,7 +734,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         f.write_text(json.dumps(merge_finished({}, rows)[0], indent=1) + "\n")
 
     readme = _readme(staged, repos, pm, copied_creds, opts.remote_harness)
-    (hdir / "README.md").write_text(readme)
+    (hdir / "README.md").write_text(readme, errors="backslashreplace")  # filenames need not be UTF-8
     _append_section(home / ("CLAUDE.md" if opts.remote_harness == "claude" else "AGENTS.md"), HANDOFF_POINTER)
 
     manifest = {
@@ -714,10 +753,10 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         "extras": extras,
         "tools": [t.to_dict() for t in tools_all],
     }
-    (hdir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    (hdir / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n", errors="backslashreplace")
     shutil.rmtree(work, ignore_errors=True)
     manifest["home"] = str(home)
-    manifest["bytes"] = inv._dir_bytes(home, skip=set())
+    manifest["bytes"] = inv._dir_bytes(home, skip=set(), limit_files=None)
     return manifest
 
 
@@ -773,18 +812,30 @@ def _copy_missing(src: Path, dest: Path, skipped: Optional[list] = None) -> int:
     """Copy a tree without overwriting anything already staged, and without
     secret-looking files or symlinks that point outside it."""
     n = 0
+    root = src.resolve()
     for f in src.rglob("*"):
-        if f.is_symlink() and src.resolve() not in f.resolve().parents:
-            if skipped is not None:
-                skipped.append(str(f))
+        rel = f.relative_to(src)
+        if any((src / parent).is_symlink() for parent in rel.parents if str(parent) != "."):
+            continue  # under a symlinked directory, which is recreated as a link below
+        if f.is_symlink():
+            target = f.resolve()
+            if target != root and root not in target.parents:
+                if skipped is not None:
+                    skipped.append(str(f))  # points outside: may be a login file
+                continue
+            out = dest / rel
+            if not os.path.lexists(out):
+                out.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(os.readlink(f), out)
+                n += 1
             continue
         if not f.is_file():
             continue
-        if inv.is_secret_file(f.name):
+        if inv.is_secret_path(str(rel)):
             if skipped is not None:
                 skipped.append(str(f))
             continue
-        out = dest / f.relative_to(src)
+        out = dest / rel
         if out.exists():
             continue
         out.parent.mkdir(parents=True, exist_ok=True)

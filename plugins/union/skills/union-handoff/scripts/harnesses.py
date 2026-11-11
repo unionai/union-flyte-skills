@@ -277,8 +277,11 @@ def claude_parse(s: Session) -> Parsed:
     for path in [s.path] + sidecars:
         main = path == s.path
         for rec in _jsonl(path):
-            if main and rec.get("cwd") and rec["cwd"] not in p.cwds:
-                p.cwds.append(rec["cwd"])
+            if rec.get("cwd") and rec["cwd"] not in p.cwds:
+                if main:
+                    p.cwds.append(rec["cwd"])
+                elif rec["cwd"] not in p.paths:
+                    p.paths.append(rec["cwd"])  # a sub-agent working elsewhere
             if main and rec.get("gitBranch"):
                 p.branch = rec["gitBranch"]
             msg = rec.get("message") or {}
@@ -601,6 +604,27 @@ def _opencode_db_parts(db: Path, sid: str) -> list[tuple[str, dict]]:
     return out
 
 
+def _opencode_part_text(part: dict) -> str:
+    """One part of an opencode message, as text for a written handoff: text
+    as-is, a tool call with its input and output, anything else as JSON."""
+    kind = part.get("type")
+    if kind == "text":
+        return str(part.get("text", ""))
+    if kind == "tool":
+        state = part.get("state") or {}
+        out = [f"[tool {part.get('tool')}] input: {json.dumps(state.get('input'), ensure_ascii=False)}"]
+        if state.get("output") is not None:
+            out.append(f"output:\n{state.get('output')}")
+        if state.get("error") is not None:
+            out.append(f"error: {state.get('error')}")
+        return "\n".join(out)
+    if kind == "reasoning":
+        return f"[reasoning]\n{part.get('text', '')}"
+    if kind in ("step-start", "step-finish"):
+        return ""
+    return f"[{kind}] {json.dumps(part, ensure_ascii=False)}"
+
+
 def opencode_parse(s: Session) -> Parsed:
     p = Parsed(cwds=[s.cwd] if s.cwd else [])
     if s.path.suffix == ".db":
@@ -641,10 +665,10 @@ def opencode_parse(s: Session) -> Parsed:
                     if isinstance(inp.get(k), str):
                         p.paths.append(inp[k])
         text = "\n".join(texts)
-        calls = [f"$ {(part.get('state') or {}).get('input', {}).get('command')}" for part in parts
-                 if part.get("type") == "tool" and part.get("tool") == "bash"]
-        if text or calls:
-            p.turns.append((role, "\n".join([text] + calls).strip()))
+        rendered = [_opencode_part_text(part) for part in parts]
+        rendered = [r for r in rendered if r]
+        if rendered:
+            p.turns.append((role, "\n\n".join(rendered)))
         if role == "user" and text:
             users.append(text)
         elif role == "assistant" and text:
@@ -704,7 +728,8 @@ def hermes_parse(s: Session) -> Parsed:
         role = r["role"] if "role" in keys else None
         content = r["content"] if "content" in keys else None
         if content:
-            p.turns.append((str(role), str(content)))
+            tool = r["tool_name"] if "tool_name" in keys and r["tool_name"] else None
+            p.turns.append((f"{role} ({tool})" if tool else str(role), str(content)))
         if role == "user" and content:
             users.append(str(content))
         elif role == "assistant" and content:
@@ -721,9 +746,9 @@ def hermes_parse(s: Session) -> Parsed:
                     args = json.loads(fn.get("arguments") or "{}")
                 except (TypeError, ValueError):
                     args = {}
+                p.turns.append((str(role), f"[tool {fn.get('name')}] {json.dumps(args, ensure_ascii=False)}"))
                 if fn.get("name") == "terminal" and args.get("command"):
                     p.commands.append(str(args["command"]))
-                    p.turns.append((str(role), f"$ {args['command']}"))
                 if isinstance(args.get("path"), str):
                     p.paths.append(args["path"])
     if users:
@@ -797,8 +822,9 @@ def parse(s: Session) -> Parsed:
     import inventory  # local import: inventory has no harness knowledge
 
     p = other_parse(s) if s.harness == "other" else READERS[s.harness][1](s)
+    cwd = p.cwds[0] if p.cwds else s.cwd
     for c in p.commands:
-        p.paths.extend(inventory.command_dirs(c))
+        p.paths.extend(inventory.command_dirs(c, cwd))
     return p
 
 

@@ -39,6 +39,24 @@ def is_secret_file(name: str) -> bool:
     return bool(SECRET_FILE_RE.match(name)) and not name.endswith(".pub")
 
 
+# Directories whose contents are credentials whatever the filenames are.
+SECRET_DIRS = {".ssh", ".gnupg", ".aws", ".azure", ".kube", "gcloud", "gh", ".docker", ".password-store"}
+SECRET_FILE_NAMES_ANYWHERE = {".credentials.json", "hosts.yml"}
+
+
+def is_secret_path(rel: str) -> bool:
+    """Whether a path (relative to whatever is being copied) holds a secret:
+    by its own name, or by sitting in a credentials directory (.kube/config,
+    gh/hosts.yml, .docker/config.json, .ssh/anything)."""
+    parts = Path(rel).parts
+    if not parts:
+        return False
+    name = parts[-1]
+    if is_secret_file(name) or name in SECRET_FILE_NAMES_ANYWHERE:
+        return not name.endswith(".pub")
+    return any(p in SECRET_DIRS for p in parts[:-1]) or name in SECRET_DIRS
+
+
 def file_credential_id(path: Path) -> str:
     """A credential id that names exactly one file: two repos with the same
     name can both hold a .env, and picking one must not pick the other."""
@@ -79,11 +97,16 @@ def scan_secret_values(lines: Iterable[str]) -> dict[str, int]:
     return found
 
 
+_TEXT_USERINFO_RE = re.compile(r"\b([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
+
+
 def redact_values(text: str) -> str:
-    """Text with anything credential-looking replaced by its kind."""
+    """Text with anything credential-looking replaced by its kind, and URL
+    user:password@ parts removed. Redact BEFORE shortening: a cut token is
+    too short to match."""
     for rx, kind in SECRET_VALUE_PATTERNS:
         text = rx.sub(f"<redacted {kind}>", text)
-    return text
+    return _TEXT_USERINFO_RE.sub(r"\1<redacted>@", text)
 
 
 _USERINFO_RE = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
@@ -95,7 +118,8 @@ def redact_url(url: Optional[str]) -> Optional[str]:
 
 
 def _git(repo: Path, *args: str, check: bool = False) -> str:
-    proc = subprocess.run(["git", "-C", str(repo), *args], text=True, capture_output=True)
+    # surrogateescape: repo paths and filenames need not be UTF-8.
+    proc = subprocess.run(["git", "-C", str(repo), *args], text=True, errors="surrogateescape", capture_output=True)
     if check and proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}")
     return proc.stdout.strip() if proc.returncode == 0 else ""
@@ -140,13 +164,13 @@ class Repo:
         return asdict(self)
 
 
-def _dir_bytes(root: Path, skip: set[str] = SKIP_DIRS, limit_files: int = 200_000) -> int:
+def _dir_bytes(root: Path, skip: set[str] = SKIP_DIRS, limit_files: Optional[int] = 200_000) -> int:
     total = n = 0
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip]
         for f in filenames:
             n += 1
-            if n > limit_files:
+            if limit_files is not None and n > limit_files:
                 return total
             try:
                 total += os.lstat(os.path.join(dirpath, f)).st_size
@@ -170,9 +194,10 @@ def tree_secret_files(root: Path) -> list[str]:
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for f in filenames + [d for d in dirnames if is_secret_file(d)]:
-            if is_secret_file(f):
-                out.append(os.path.relpath(os.path.join(dirpath, f), root))
+        for f in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, f), root)
+            if is_secret_path(rel):
+                out.append(rel)
     return sorted(out)
 
 
@@ -197,7 +222,7 @@ def describe_repo(path: Path) -> Repo:
         r.tree_bytes = _dir_bytes(top)
         return r
     for f in untracked(top):
-        if is_secret_file(Path(f).name):
+        if is_secret_path(f):
             r.secret_files.append(f)
         r.untracked_files += 1
         try:
@@ -205,11 +230,14 @@ def describe_repo(path: Path) -> Repo:
         except OSError:
             pass
     tracked = _z(subprocess.run(["git", "-C", str(top), "ls-files", "-z"], capture_output=True).stdout)
-    r.tracked_secret_files = [f for f in tracked if is_secret_file(Path(f).name)]
+    r.tracked_secret_files = [f for f in tracked if is_secret_path(f)]
     r.submodules = sum(1 for line in _git(top, "submodule", "status").splitlines() if line.strip())
-    patch = subprocess.run(["git", "-C", str(top), "diff", "HEAD", "--binary"], capture_output=True).stdout
-    r.patch_bytes = len(patch)
-    r.secrets_in_patch = scan_secret_values(patch.decode(errors="replace").splitlines())
+    # The staged and the unstaged patch both travel, and a secret staged then
+    # reverted in the working tree shows in neither `diff HEAD` nor the files.
+    staged = subprocess.run(["git", "-C", str(top), "diff", "--cached", "--binary"], capture_output=True).stdout
+    unstaged = subprocess.run(["git", "-C", str(top), "diff", "--binary"], capture_output=True).stdout
+    r.patch_bytes = len(staged) + len(unstaged)
+    r.secrets_in_patch = scan_secret_values((staged + b"\n" + unstaged).decode(errors="replace").splitlines())
     common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common:
         r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())
@@ -419,21 +447,34 @@ def command_names(command: str) -> list[str]:
     return names
 
 
-def command_dirs(command: str) -> list[str]:
+def command_dirs(command: str, cwd: Optional[str] = None) -> list[str]:
     """Directories a shell command line moves into or points git at
     (``cd DIR``, ``pushd DIR``, ``git -C DIR``): repos a session worked in
-    through its shell rather than its file tools."""
+    through its shell rather than its file tools. Relative paths resolve
+    against ``cwd`` when it is known."""
     dirs = []
     for segment in split_segments(command):
         try:
             words = shlex.split(segment)
         except ValueError:
             continue
-        for i, w in enumerate(words[:-1]):
-            if (w in ("cd", "pushd") and i == 0) or (w == "-C" and "git" in words[:i]):
-                d = words[i + 1]
-                if d.startswith(("/", "~")):
-                    dirs.append(os.path.expanduser(d))
+        while words and (_ASSIGN_RE.match(words[0]) or words[0] in ("sudo", "env", "time", "nohup", "exec", "command")):
+            words = words[1:]
+        if not words:
+            continue
+        target = None
+        if words[0] in ("cd", "pushd") and len(words) > 1:
+            target = words[1]
+        elif os.path.basename(words[0]) == "git" and "-C" in words[1:-1]:
+            target = words[words.index("-C", 1) + 1]
+        if not target or target.startswith("-"):
+            continue
+        target = os.path.expanduser(target)
+        if not os.path.isabs(target):
+            if not cwd:
+                continue
+            target = os.path.normpath(os.path.join(cwd, target))
+        dirs.append(target)
     return dirs
 
 

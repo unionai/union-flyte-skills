@@ -534,7 +534,8 @@ def test_database_handoff_carries_the_whole_conversation(machine, tmp_path):
     out = tmp_path / "o"
     stg.stage([hz.find(machine["hermes"])], stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
     text = (out / "home/handoff/write-docs/transcript.md").read_text()
-    assert "Write the docs" in text and "a distinctive middle message" in text and "$ mkdocs build" in text
+    assert "Write the docs" in text and "a distinctive middle message" in text
+    assert '[tool terminal] {"command": "mkdocs build"}' in text
 
 
 def test_non_utf8_untracked_filename(machine, tmp_path):
@@ -624,4 +625,149 @@ def test_interrupted_copy_leaves_the_mount_unpublished(machine, tmp_path, monkey
     assert "nothing has been published" in msg
     pid = int(msg.split("pid ")[1].split(",")[0])
     os.kill(pid, 0)  # the mount is still up: it was neither signalled nor published
+    os.kill(pid, 9)
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the second review
+
+
+def test_secret_directories_are_left_behind(machine, tmp_path):
+    plain = Path(machine["home"]) / "ops"
+    (plain / ".kube").mkdir(parents=True)
+    (plain / ".kube" / "config").write_text(world.FAKE_SECRET)
+    (plain / "gh").mkdir()
+    (plain / "gh" / "hosts.yml").write_text(world.FAKE_SECRET)
+    (plain / "README.md").write_text("ops")
+    t = tmp_path / "t.jsonl"
+    t.write_text("{}\n")
+    out = tmp_path / "o"
+    stg.stage([hz.find(f"file:{t}@{plain}")], stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
+    assert (out / "home/src/ops/README.md").exists()
+    assert world.FAKE_SECRET.encode() not in b"".join(f.read_bytes() for f in (out / "home").rglob("*") if f.is_file())
+
+
+def test_staged_secret_reverted_in_worktree_is_caught(machine, tmp_path):
+    web = Path(machine["webapp"])
+    (web / "config.py").write_text("KEY = 'ghp_" + "Z9y8X7w6" * 5 + "'\n")
+    subprocess.run(["git", "-C", str(web), "add", "config.py"], check=True)
+    (web / "config.py").write_text("KEY = None\n")
+    with pytest.raises(SystemExit) as e:
+        stage_all(machine, tmp_path, "claude")
+    assert "GitHub token" in str(e.value)
+    rep = __import__("handoff").build_report([hz.find(machine["claude"])], None)
+    assert any(r["secrets_in_patch"] for r in rep["repos"])
+
+
+def test_redaction_happens_before_truncation():
+    token = "ghp_" + "Q" * 36
+    text = "x" * 190 + " " + token
+    shown = inv.redact_values(text)
+    assert token[:8] not in hz._short(shown, 200)
+    assert inv.redact_values("see https://bob:pw@host/r") == "see https://<redacted>@host/r"
+
+
+def test_tree_copy_drops_url_credentials_and_nested_worktree_pointers(machine, tmp_path):
+    plain = Path(machine["home"]) / "plain"
+    plain.mkdir()
+    (plain / "a.txt").write_text("a")
+    nested = plain / "wt"
+    nested.mkdir()
+    (nested / ".git").write_text("gitdir: /old/machine/.git/worktrees/wt\n")
+    empty = Path(machine["home"]) / "fresh"
+    subprocess.run(["git", "init", "-q", str(empty)], check=True)
+    subprocess.run(["git", "-C", str(empty), "remote", "add", "origin", f"https://bob:{world.FAKE_SECRET}@example.com/r.git"], check=True)
+    ts = []
+    for d in (plain, empty):
+        t = tmp_path / f"{d.name}.jsonl"
+        t.write_text("{}\n")
+        ts.append(hz.find(f"file:{t}@{d}"))
+    out = tmp_path / "o"
+    stg.stage(ts, stg.StageOptions(out=out, remote_harness="claude", log=lambda x: None))
+    assert not (out / "home/src/plain/wt/.git").exists()
+    assert world.FAKE_SECRET not in (out / "home/src/fresh/.git/config").read_text()
+
+
+def test_temp_branch_never_collides(machine, tmp_path):
+    infra = Path(machine["infra"])
+    subprocess.run(["git", "-C", str(infra), "branch", "union-handoff-unborn"], check=True)
+    home, _ = stage_all(machine, tmp_path, "claude")
+    assert "union-handoff-unborn" in _git(home / "src/infra", "branch")
+    assert _git(home / "src/infra", "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+
+def test_out_inside_a_harness_dir_is_refused(machine, tmp_path):
+    with pytest.raises(SystemExit):
+        stg.stage([hz.find(machine["claude"])], stg.StageOptions(
+            out=Path(machine["home"]) / ".claude/skills/out", remote_harness="claude", log=lambda x: None))
+
+
+def test_relative_cd_and_printed_git_commands():
+    assert inv.command_dirs("cd ../tools && make", "/w/app") == ["/w/tools"]
+    assert inv.command_dirs("echo git -C /private/repo") == []
+    assert inv.command_dirs("sudo git -C /real status") == ["/real"]
+
+
+def test_safe_internal_symlinks_in_skills_survive(machine, tmp_path):
+    skill = Path(machine["home"]) / ".claude/skills/my-skill"
+    (skill / "v1").mkdir()
+    (skill / "v1" / "ref.md").write_text("ref")
+    (skill / "current").symlink_to("v1")
+    home, _ = stage_all(machine, tmp_path, "claude")
+    link = home / ".claude/skills/my-skill/current"
+    assert link.is_symlink() and (link / "ref.md").read_text() == "ref"
+
+
+def test_unknown_tools_keep_setup_failing(tmp_path):
+    t = inv.Tool("mystery", 1, None, "unknown", None, None)
+    t.linux_install = inv.linux_install_line(t)
+    assert t.linux_install.startswith("# TODO")
+    script = stg.setup_script([t])
+    assert "need mystery ':'" in script
+
+
+def test_report_does_not_offer_secret_directories_as_files(machine):
+    plain = Path(machine["home"]) / "ops2"
+    (plain / ".kube").mkdir(parents=True)
+    (plain / ".kube" / "config").write_text("x")
+    r = inv.describe_repo(plain)
+    assert r.secret_files == [".kube/config"]
+
+
+SEAL_DRIVER = textwrap.dedent("""\
+    import sys, time
+    from pathlib import Path
+    sys.path.insert(0, sys.argv[1])
+    import seal as sl
+    sl.os.path.ismount = lambda p: Path(p, ".mounted").exists()
+    real = sl.copy_into
+    def slow(*a, **k):
+        print("COPYING", flush=True)
+        time.sleep(30)
+        return real(*a, **k)
+    sl.copy_into = slow
+    sl.seal(sl.SealOptions(staged_home=Path(sys.argv[2]), volume="v", flyte=sys.argv[3],
+                           mountpoint=Path(sys.argv[4]), mount_timeout=30))
+""")
+
+
+def test_terminal_ctrl_c_does_not_reach_the_mount(machine, tmp_path):
+    import signal as _signal
+    home, _ = stage_all(machine, tmp_path, "claude")
+    flyte = tmp_path / "flyte"
+    flyte.write_text(FAKE_FLYTE.replace('print("published"', 'open(mnt + "/../PUBLISHED", "w").close(); print("published"'))
+    flyte.chmod(0o755)
+    driver = tmp_path / "driver.py"
+    driver.write_text(SEAL_DRIVER)
+    mnt = tmp_path / "mnt"
+    # Its own process group, standing in for the terminal's foreground group.
+    proc = subprocess.Popen([sys.executable, str(driver), str(SCRIPTS), str(home), str(flyte), str(mnt)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    assert proc.stdout.readline().strip() == "COPYING"
+    os.killpg(proc.pid, _signal.SIGINT)  # what Ctrl-C does: signal the whole foreground group
+    _, err = proc.communicate(timeout=30)
+    assert "nothing has been published" in err
+    assert not (tmp_path / "PUBLISHED").exists()
+    pid = int(err.split("pid ")[1].split(",")[0])
+    os.kill(pid, 0)
     os.kill(pid, 9)

@@ -211,7 +211,7 @@ def print_report(rep: dict) -> None:
     print(f"  transcripts {human(t['transcript_bytes'])}; repos about {human(t['repo_bytes_estimate'])};"
           f" total about {human(t['total_bytes_estimate'])}")
     print("  (an estimate: repo history is the whole object store; skills, memory and the checked-out")
-    print("  files come on top. `stage` prints the exact size.)")
+    print("  files come on top. `stage` prints the staged size.)")
     print("\nThe report covers credential files and values in transcripts and uncommitted changes.")
     print("It cannot see a secret committed and later deleted: that stays in the git history.")
 
