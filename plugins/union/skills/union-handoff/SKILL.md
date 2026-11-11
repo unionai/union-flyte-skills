@@ -194,11 +194,10 @@ mount yourself.
 `seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`).
 Do not start any session; they wait in the home, finished.
 
-In the Union console, open the new-agent dialog and paste the locator into
-**Home volume**. For a merge, start the existing agent the same way, with the
-locator of the version `seal` just published. The field takes a locator,
-not an artifact name, so keep the one `seal` printed (it is also in the
-JSON `seal` writes, under `locator`).
+In the Union console, open **New agent** and paste the locator into
+**Home volume** (an optional field). The agent boots with the handoff as its
+home. The field takes a locator, not an artifact name, so keep the one `seal`
+printed (it is also in the JSON `seal` writes, under `locator`).
 
 Then tell the user where to find each session:
 
