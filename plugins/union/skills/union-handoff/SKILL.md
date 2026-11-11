@@ -189,13 +189,19 @@ Start an agent with it as its home; do not start any session, they wait in
 the home, finished.
 
 ```bash
-python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name> \
-  --launcher-task <launcher-task> --project <project> --domain <domain>
+python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name>
 ```
 
-This runs `flyte run deployed-task <launcher-task> --identifier <agent-name>
---home_locator <locator>` in the project and domain where your organization
-runs agents. Ask the user, or their Union admin, for those three values; add
+This runs Union's agent launcher:
+
+```bash
+flyte run --project system --domain production \
+  deployed-task agent-workspace-launcher.launch_agent_workspace \
+  --identifier <agent-name> --home_locator <locator>
+```
+
+`system` / `production` is where each organization's launcher lives; pass
+`--project`, `--domain` or `--launcher-task` if the user's org differs. Add
 `--dry-run` to show the command first. Use a new name for `--identifier`:
 that creates the agent. The run `flyte` prints is the agent's; it stays
 running while the agent is on.

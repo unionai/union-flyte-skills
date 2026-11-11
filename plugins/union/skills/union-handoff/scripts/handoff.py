@@ -16,8 +16,8 @@
                   [--bucket URI] [--project P --domain D] [--dry-run]
       Copy the staged home into a new (or forked) Union Volume and seal it.
 
-  handoff.py launch --locator LOC --identifier NAME --launcher-task TASK
-                    --project P --domain D [--dry-run]
+  handoff.py launch --locator LOC --identifier NAME [--project system --domain production]
+                    [--launcher-task agent-workspace-launcher.launch_agent_workspace] [--dry-run]
       Start a Union agent with the sealed volume as its home (sessions not
       started), through `flyte run deployed-task`.
 
@@ -307,6 +307,10 @@ def cmd_seal(args) -> int:
     return 0
 
 
+# Union's agent launcher, deployed in each organization that runs agents.
+LAUNCHER_TASK = "agent-workspace-launcher.launch_agent_workspace"
+
+
 def launch_command(args) -> list[str]:
     return [args.flyte, "run", "--project", args.project, "--domain", args.domain,
             "deployed-task", args.launcher_task,
@@ -391,9 +395,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--locator", required=True, help="the locator `seal` printed")
     p.add_argument("--identifier", required=True,
                    help="the agent's name: a new one, or an existing agent that is turned off (to give it this home)")
-    p.add_argument("--launcher-task", required=True, help="the deployed task that starts agents in your org")
-    p.add_argument("--project", required=True, help="the project the launcher lives in")
-    p.add_argument("--domain", required=True, help="the domain the launcher lives in")
+    p.add_argument("--launcher-task", default=LAUNCHER_TASK, help=f"the deployed task that starts agents (default: {LAUNCHER_TASK})")
+    p.add_argument("--project", default="system", help="the project the launcher lives in (default: system)")
+    p.add_argument("--domain", default="production", help="the domain the launcher lives in (default: production)")
     p.add_argument("--flyte", default="flyte", help="the flyte CLI to run")
     p.add_argument("--dry-run", action="store_true", help="print the command only")
     p.set_defaults(func=cmd_launch)

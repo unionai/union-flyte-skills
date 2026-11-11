@@ -986,12 +986,14 @@ def test_launch_command(machine, tmp_path):
     flyte = tmp_path / "flyte"
     flyte.write_text("#!/bin/sh\necho \"$@\" > \"$0.argv\"\necho 'Created Run: abc123'\n")
     flyte.chmod(0o755)
-    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent",
-            "--launcher-task", "<launcher-task>", "--project", "<project>", "--domain", "<domain>"]
+    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent"]
     dry = run_cli(machine, *args, "--dry-run")
     assert dry.returncode == 0
-    assert dry.stdout.strip() == ("flyte run --project '<project>' --domain '<domain>' deployed-task '<launcher-task>' "
+    assert dry.stdout.strip() == ("flyte run --project system --domain production deployed-task "
+                                  "agent-workspace-launcher.launch_agent_workspace "
                                   "--identifier my-agent --home_locator s3://b/v/x.metadata.json")
+    other = run_cli(machine, *args, "--project", "p", "--domain", "d", "--launcher-task", "t", "--dry-run")
+    assert other.stdout.split()[2:7] == ["--project", "p", "--domain", "d", "deployed-task"]
     real = run_cli(machine, *args, "--flyte", str(flyte))
     assert real.returncode == 0 and "Created Run: abc123" in real.stdout
     assert Path(str(flyte) + ".argv").read_text().split()[-4:] == [
