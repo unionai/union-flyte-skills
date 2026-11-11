@@ -1,6 +1,6 @@
 ---
 name: union-handoff
-description: Move work from this machine's coding agent (Claude Code, Codex, pi, opencode, Hermes) into a Union agent. Finds recent sessions with their repos, branches, uncommitted changes, memory and skills; reports sizes, tools used and credentials found before copying anything; packages the chosen sessions into a sealed Union Volume as the agent's home, so they show up as finished sessions that resume on Restart. Use when the user wants to hand off, move, continue or offload a local session to Union, or run it remotely.
+description: Move work from this machine's coding agent (Claude Code, Codex, pi, opencode, Hermes) toward a Union agent. Finds recent sessions with their repos, branches, uncommitted changes, memory and skills; reports sizes, tools used and credentials found before copying anything; packages the chosen sessions into a sealed Union Volume laid out as an agent home, where they are listed as finished sessions that resume on Restart. Starting an agent from that volume is not supported by Union yet. Use when the user wants to hand off, move, continue or offload a local session to Union, or run it remotely.
 ---
 
 # Hand off local sessions to a Union agent
@@ -112,13 +112,18 @@ Re-run the report with `--remote-harness <choice>` if it changes anything.
 
 ## 5. Ask: a new agent, or merge into an existing one
 
-- **New agent** (default): a fresh volume becomes its home.
-- **Merge** into an existing agent's home: its volume is forked, the handoff
-  is added, and a new version is sealed. Nothing already there is
-  overwritten. If the home already has one of the handoff's repos or
-  sessions, `seal` stops before copying anything and lists them; re-stage
-  with `--exclude` for those, or use a new agent. Ask for the agent home's
-  artifact name.
+Tell the user plainly before they choose: **Union cannot yet start an agent
+from a volume made outside it, and an existing agent does not pick up a new
+version of its home published from outside.** Today the handoff produces a
+sealed volume laid out as an agent home, ready for when that lands. Then ask:
+
+- **New agent** (default): the handoff goes into a fresh volume.
+- **Merge** with an existing agent's home: its volume is forked and the
+  handoff added as a new sealed version. Nothing already there is
+  overwritten; if the home already has one of the handoff's repos or
+  sessions, `seal` stops before copying anything and lists them. The agent
+  will not use this version until Union supports it (step 7). Ask for the
+  agent home's artifact name.
 
 ## 6. Stage, review, seal
 
@@ -169,17 +174,24 @@ publishes what is in it. So if the copy fails or is interrupted part way,
 and publish, or discard it. Relay that to the user as it is; do not stop the
 mount yourself.
 
-## 7. Start the agent
+## 7. Starting the agent: not supported yet
 
-The sessions must **not** be started during the handoff: they wait, finished,
-in the agent's home.
+**Union does not yet start an agent from a volume made outside it.** The
+console starts an agent fresh or from that agent's own earlier runs; it
+cannot be pointed at this volume. An existing agent does not pick up a home
+version published from outside either. Say so plainly, and do not try a
+workaround.
 
-> TODO for the user: starting a Union agent with a given volume as its home
-> is not yet covered in the public Union docs. In the Union console, create
-> (or open) the agent and choose the volume artifact from step 6 as its home.
-> If your console does not offer that, ask your Union admin.
+Give the user what they have:
 
-Then tell the user where to find each session:
+- the sealed volume: its name, artifact name and the locator `seal` printed;
+- the staged copy under `--out`, which is exactly what the volume holds;
+- the list of sessions in `home/.handoff/README.md`.
+
+When an agent can start from this volume, its sessions wait there, finished,
+not started.
+
+Once an agent can run on this home, each session is found as follows:
 
 - **Resumable sessions** are listed under the agent's finished sessions, by
   the names in `home/.handoff/README.md`. **Restart** resumes one where it
