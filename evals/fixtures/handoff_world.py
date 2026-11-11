@@ -82,6 +82,18 @@ def build(root: Path) -> dict:
     (webapp / ".env").write_text(f"API_KEY={CANARY}\n")
     infra = _repo(home, "infra", "main")
 
+    # A stand-in for github.com/example: bare repos holding what each repo's
+    # remote-tracking refs say the remote has, reached through an insteadOf
+    # in this machine's ~/.gitconfig. `git ls-remote` and `git clone` of the
+    # fixture's https URLs then work offline.
+    remotes = root / "github"
+    for repo in (webapp, infra):
+        bare = remotes / f"{repo.name}.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+        _git(repo, "push", "-q", str(bare), "refs/remotes/origin/main:refs/heads/main")
+        subprocess.run(["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    (home / ".gitconfig").write_text(f'[url "{remotes.as_uri()}/"]\n\tinsteadOf = https://github.com/example/\n')
+
     # Claude Code: a session in webapp that also edits infra.
     proj = home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(webapp))
     base = {"sessionId": CLAUDE_ID, "cwd": str(webapp), "gitBranch": "feature/login", "version": "2.0.0"}
@@ -199,4 +211,5 @@ def build(root: Path) -> dict:
         "opencode": f"opencode:{OPENCODE_ID}",
         "hermes": f"hermes:{HERMES_ID}",
         "canary": CANARY,
+        "github": remotes,
     }
