@@ -93,7 +93,8 @@ def default_remote(local: str) -> str:
 
 
 def build_report(sessions: list[hz.Session], remote_harness: str | None,
-                 exclude: set[str] = frozenset(), include: set[str] = frozenset()) -> dict:
+                 exclude: set[str] = frozenset(), include: set[str] = frozenset(),
+                 ship: set[str] = frozenset()) -> dict:
     import stage as stg
 
     home = hz.home()
@@ -128,6 +129,9 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None,
             "arrives": "resumable" if resumable else "handoff note",
         })
     repos = list(repo_map.values())
+    for r in repos:
+        if r.path in ship and r.plan == "reference":
+            r.plan, r.plan_note = "bundle", "--ship"
     tools = inv.tools_from([c for p in parsed.values() for c in p.commands], home)
     creds, env_names = inv.credentials(home, repos)
 
@@ -135,7 +139,7 @@ def build_report(sessions: list[hz.Session], remote_harness: str | None,
     repo_bytes = 0
     for r in repos:
         if r.plan == "reference":
-            repo_bytes += r.patch_bytes + r.untracked_bytes  # plus a small bundle of the unpushed commits
+            repo_bytes += r.unpushed_bytes + r.patch_bytes + r.untracked_bytes
         elif r.git and r.head:
             repo_bytes += r.history_bytes + r.patch_bytes + r.untracked_bytes
         else:
@@ -175,16 +179,21 @@ def print_report(rep: dict) -> None:
         elif r["git"]:
             print(f"  {r['path']}  branch {r['branch']}  remote {r['remote'] or '(none)'}")
             if r["plan"] == "reference":
-                print(f"    travels by reference: re-cloned from {r['clone_url']} when the agent first boots;")
-                print("      only what the remote lacks is shipped (the commits below, the changes, untracked files).")
-                print("      The agent needs read access to that remote; ship it whole instead with --ship <repo>.")
+                print(f"    travels by reference: re-cloned from {r['clone_url']} when the agent first boots.")
+                print(f"      Shipped: every local branch and tag commit the remote lacks ({human(r['unpushed_bytes'])}),")
+                print("      the uncommitted changes and the untracked files. The agent needs read access to that")
+                print("      remote; ship the whole history instead with --ship <repo>.")
             else:
+                why = f" ({r['plan_note']})" if r.get("plan_note") else ""
                 print(f"    travels as: git bundle of {len(r['branches'])} local branch(es), remote-tracking branches and tags,"
-                      f" up to {human(r['history_bytes'])} of history (no remote to re-clone from)")
+                      f" up to {human(r['history_bytes'])} of history{why}")
+            if r["uses_lfs"]:
+                print("    WARNING: uses Git LFS. LFS files that were never pushed are not carried; push them first.")
             print(f"    uncommitted: {r['modified_files']} modified file(s), patch {human(r['patch_bytes'])};"
                   f" {r['untracked_files']} untracked file(s), {human(r['untracked_bytes'])}")
             if r["unpushed_commits"]:
-                print(f"    {r['unpushed_commits']} commit(s) not on the remote: push them first, or they travel in a bundle")
+                print(f"    {r['unpushed_commits']} commit(s) on local branches or tags that are not on the remote:"
+                      " push them first, or they travel in the volume")
             if r["secret_files"]:
                 print(f"    secret-looking untracked files, left behind unless picked: {', '.join(r['secret_files'])}")
             if r["tracked_secret_files"]:
@@ -193,7 +202,8 @@ def print_report(rep: dict) -> None:
                 kinds = ", ".join(f"{n} {k}" for k, n in r["flagged_in_patch"].items())
                 print(f"    WARNING: the uncommitted changes hold credential-looking values ({kinds})")
             if r["submodules"]:
-                print(f"    {r['submodules']} submodule(s): not followed; the agent re-clones them with `git submodule update --init`")
+                print(f"    {r['submodules']} submodule(s): set up again from their remotes on first boot; work not"
+                      " committed and pushed inside a submodule is NOT carried")
             if r["worktree"]:
                 print("    a linked git worktree: it is rebuilt as a standalone repo from the bundle")
         else:
@@ -229,7 +239,8 @@ def print_report(rep: dict) -> None:
 def cmd_report(args) -> int:
     rep = build_report(_sessions(args.session), args.remote_harness,
                        exclude={str(Path(p).expanduser().resolve()) for p in args.exclude or []},
-                       include={str(Path(p).expanduser().resolve()) for p in args.include or []})
+                       include={str(Path(p).expanduser().resolve()) for p in args.include or []},
+                       ship={str(Path(p).expanduser().resolve()) for p in args.ship or []})
     if args.json:
         print(json.dumps(rep, indent=1))
     else:
@@ -308,6 +319,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote-harness", choices=hz.REMOTE_HARNESSES, help="default: each session's own harness")
     p.add_argument("--exclude", action="append", help="leave this repo out")
     p.add_argument("--include", action="append", help="also move this repo or directory")
+    p.add_argument("--ship", action="append", help="plan this repo to ship whole instead of re-cloning")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_report)
 

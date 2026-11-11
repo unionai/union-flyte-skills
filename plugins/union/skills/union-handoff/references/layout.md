@@ -29,16 +29,30 @@ CLAUDE.md or AGENTS.md              a short note pointing at .handoff/ (appended
 ## Repos
 
 **By reference** (the default for a repo with a remote): nothing of the repo
-itself is copied. `.handoff/repos/<repo>/repo.json` records the remote URL
-(minus any `user:password@`), the branch, the commit, and which repo it is a
-worktree of. Shipped beside it is only what the remote lacks: a bundle of the
-commits after the newest one the remote has (by the last fetch), the staged
-and unstaged diffs, and the untracked files. On first boot
-`restore_repos.py` clones each main checkout, adds its worktrees with
-`git worktree add`, fetches the bundle, checks out the branch at the same
+itself is copied. `.handoff/repos/<repo>/repo.json` records the remote's name
+and URL as configured (minus any http(s) credentials; an ssh user name is
+kept), every local branch with its commit and upstream, the checked-out
+branch or commit, and which repo it is a worktree of. What the remote has is
+asked of the remote itself (`git ls-remote`), not read from tracking refs
+that may be stale. Shipped beside it is only what the remote lacks: one
+bundle of every local branch, tag and HEAD commit not reachable from the
+remote's current tips, the staged and unstaged diffs, and the untracked
+files. If the remote cannot be reached, or shares no commits with the repo,
+the repo is shipped whole instead.
+
+On first boot `restore_repos.py` clones each main checkout (keeping the
+remote's name), adds its worktrees with `git worktree add` (fetching a
+worktree's own remote first when it differs), fetches the bundle, recreates
+the local branches with their upstreams, checks out the same branch and
 commit, applies the staged diff to the index and the unstaged one to the
-working tree, and copies the untracked files. A repo already restored is
-skipped, so it can run again after a failed clone.
+working tree, copies the untracked files, and initialises submodules. It
+works in a temporary directory and moves the result into place only when
+every step succeeded, so a failure leaves nothing half-restored and a rerun
+retries just that repo. A destination that already holds something is
+refused, not overwritten.
+
+Not carried either way: work inside submodules that was never pushed, and
+Git LFS files that were never pushed (the report warns about both).
 
 **Shipped whole** (no remote, or `--ship`): rebuilt from a bundle of its
 local branches, remote-tracking branches and tags, so branch upstreams and

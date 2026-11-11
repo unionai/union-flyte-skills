@@ -116,6 +116,10 @@ def _units(home: Path) -> list[str]:
         d = home / parent
         if d.is_dir():
             units += [f"{parent}/{c.name}" for c in sorted(d.iterdir())]
+    # Repos that travel by reference land on the agent at first boot, but a
+    # home that already has that path must still count as a collision.
+    for spec in sorted((home / ".handoff" / "repos").glob("*/repo.json")):
+        units.append(json.loads(spec.read_text())["path"])
     projects = home / ".claude" / "projects"
     if projects.is_dir():
         for proj in sorted(projects.iterdir()):

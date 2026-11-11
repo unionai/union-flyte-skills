@@ -173,7 +173,8 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
 
     for remote in inv._git(src, "remote").splitlines():
         # Credentials embedded in a URL (https://user:token@host) stay behind.
-        url = inv.redact_url(inv._git(src, "remote", "get-url", remote))
+        # As configured, not as this machine's insteadOf rules rewrite it.
+        url = inv.redact_url(inv._git(src, "config", "--get", f"remote.{remote}.url"))
         if url:
             _run(["git", "-C", str(dest), "remote", "add", remote, url])
     for b in inv._git(src, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines():
@@ -217,20 +218,27 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
 
 
 def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[str],
-                        worktree_of: Optional[str]) -> dict:
+                        worktree_of: Optional[str], plan: dict) -> dict:
     """Record a repo to be re-cloned from its remote on first boot, and ship
-    only what the remote lacks: the commits after the remote base (a small
-    bundle), the staged and unstaged patches, and the untracked files.
-    ~/.handoff/restore_repos.py puts it back together."""
-    upstream, url, base = inv.remote_base(src)
+    only what the remote lacks: every local branch, tag and the HEAD commit
+    not reachable from the remote's current tips (one bundle), the staged and
+    unstaged patches, and the untracked files. ~/.handoff/restore_repos.py
+    puts it back together. ``plan`` is inventory.reference_plan(src)."""
     branch = inv._git(src, "symbolic-ref", "--quiet", "--short", "HEAD") or None
     head = inv._git(src, "rev-parse", "HEAD", check=True)
     meta.mkdir(parents=True)
+    has = plan["has"]
+    unpushed = int(inv._git(src, "rev-list", "--count", "--branches", "--tags", "HEAD", "--not", *has) or 0)
     bundle_bytes = 0
-    if base != head:
+    if unpushed:
         bundle = meta / "unpushed.bundle"
-        _run(["git", "-C", str(src), "bundle", "create", str(bundle), "HEAD", f"^{base}"])
+        _run(["git", "-C", str(src), "bundle", "create", str(bundle), "--branches", "--tags", "HEAD", "--not", *has])
         bundle_bytes = bundle.stat().st_size
+    branches = {}
+    for line in inv._git(src, "for-each-ref", "--format=%(refname:short) %(objectname) %(upstream:short)",
+                         "refs/heads").splitlines():
+        name, sha, *up = line.split()
+        branches[name] = {"head": sha, "upstream": up[0] if up else None}
     staged = subprocess.run(["git", "-C", str(src), "diff", "--cached", "--binary"], capture_output=True).stdout
     unstaged = subprocess.run(["git", "-C", str(src), "diff", "--binary"], capture_output=True).stdout
     for name, patch in (("staged.patch", staged), ("unstaged.patch", unstaged)):
@@ -250,16 +258,16 @@ def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[
         else:
             continue
         copied.append(rel)
-    spec = {"path": rel_dest, "url": url, "branch": branch, "head": head, "base": base,
-            "upstream": upstream, "worktree_of": worktree_of}
+    spec = {"path": rel_dest, "url": plan["url"], "remote": plan["remote"], "branch": branch, "head": head,
+            "upstream": plan["upstream"], "worktree_of": worktree_of, "branches": branches}
     (meta / "repo.json").write_text(json.dumps(spec, indent=1) + "\n")
     return {
         "mode": "reference",
-        "clone_url": url,
+        "clone_url": plan["url"],
         "branch": branch,
         "head": head,
         "worktree_of": worktree_of,
-        "unpushed_commits": int(inv._git(src, "rev-list", "--count", f"{base}..HEAD") or 0),
+        "unpushed_commits": unpushed,
         "bundle_bytes": bundle_bytes,
         "patch_bytes": len(staged) + len(unstaged),
         "untracked_copied": len(copied),
@@ -685,11 +693,13 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         for m in members:
             primary_of[str(m)] = None if m == main else remote_of[str(main)][len(rh) + 1:]
 
-    by_reference = {
-        str(top): (inv.is_git(top) and inv.has_commits(top) and str(top) not in opts.ship_repos
-                   and str(top) not in opts.tree_repos and all(inv.remote_base(top)[1:]))
-        for top in repo_paths
-    }
+    plans: dict[str, dict] = {}
+    for top in repo_paths:
+        if inv.is_git(top) and inv.has_commits(top) and str(top) not in opts.ship_repos | opts.tree_repos:
+            plans[str(top)] = inv.reference_plan(top)
+            if not plans[str(top)]["has"]:
+                opts.log(f"note  {top} travels whole: {plans[str(top)]['note']}")
+    by_reference = {str(top): bool(plans.get(str(top), {}).get("has")) for top in repo_paths}
     main_path = {remote_of[str(t)][len(rh) + 1:]: str(t) for t in repo_paths}
 
     repos: dict[str, dict] = {}
@@ -702,7 +712,8 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
             if primary and not by_reference[main_path[primary]]:
                 primary = None  # its main checkout travels whole, so clone this one on its own
             opts.log(f"repo  {top} -> {remote_of[str(top)]} (re-cloned on first boot)")
-            info = stage_git_reference(top, rel_dest, home / ".handoff" / "repos" / dest.name, picked_files, primary)
+            info = stage_git_reference(top, rel_dest, home / ".handoff" / "repos" / dest.name, picked_files, primary,
+                                       plans[str(top)])
             info["remote"] = remote_of[str(top)]
             repos[str(top)] = info
             continue
@@ -792,7 +803,10 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         if cid.startswith("file:"):
             src = Path(cid[len("file:"):])
             top = next(t for t in repo_paths if t in src.parents)
-            if (home / remote_of[str(top)][len(rh) + 1:] / src.relative_to(top)).exists():
+            rel_dest = remote_of[str(top)][len(rh) + 1:]
+            rel = src.relative_to(top)
+            if ((home / rel_dest / rel).exists()
+                    or (home / ".handoff" / "repos" / Path(rel_dest).name / "untracked" / rel).exists()):
                 copied_creds.append(cid)  # copied with its repo above
             continue
         c = by_id[cid]

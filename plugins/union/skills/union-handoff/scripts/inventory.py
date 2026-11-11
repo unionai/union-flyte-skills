@@ -109,12 +109,22 @@ def redact_values(text: str) -> str:
     return _TEXT_USERINFO_RE.sub(r"\1<redacted>@", text)
 
 
-_USERINFO_RE = re.compile(r"^([a-z][a-z0-9+.-]*://)[^/@\s]+@", re.I)
+_USERINFO_RE = re.compile(r"^([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.I)
 
 
 def redact_url(url: Optional[str]) -> Optional[str]:
-    """A remote URL without any user:password@ part."""
-    return _USERINFO_RE.sub(r"\1", url) if url else url
+    """A remote URL without credentials in it. For http(s) the whole userinfo
+    goes (a token is often the "user"); for ssh only a password goes, since
+    the user name (git@) is how the server is reached."""
+    if not url:
+        return url
+    m = _USERINFO_RE.match(url)
+    if not m:
+        return url
+    scheme, userinfo = m.group(1), m.group(2)
+    if scheme.lower().startswith(("ssh", "git+ssh")):
+        return url.replace(m.group(0), f"{scheme}{userinfo.split(':', 1)[0]}@", 1)
+    return url.replace(m.group(0), scheme, 1)
 
 
 def _git(repo: Path, *args: str, check: bool = False) -> str:
@@ -163,8 +173,12 @@ class Repo:
     # shipped), or "tree" (copied as files).
     plan: str = "tree"
     clone_url: Optional[str] = None
-    remote_base: Optional[str] = None  # newest commit of HEAD that the remote has
+    remote_name: Optional[str] = None
+    remote_has: list = field(default_factory=list)  # commits the remote has now (git ls-remote), present here
     upstream: Optional[str] = None
+    unpushed_bytes: int = 0  # objects in the local branches and tags the remote lacks
+    uses_lfs: bool = False
+    plan_note: str = ""
     flagged_in_patch: dict = field(default_factory=dict)
     sessions: list[str] = field(default_factory=list)
 
@@ -219,7 +233,7 @@ def describe_repo(path: Path) -> Repo:
     r.worktree = (top / ".git").is_file()
     r.head = _git(top, "rev-parse", "--verify", "--quiet", "HEAD") or None
     r.branch = (_git(top, "rev-parse", "--abbrev-ref", "HEAD") or None) if r.head else None
-    r.remote = redact_url(_git(top, "remote", "get-url", "origin") or None)
+    r.remote = redact_url(_git(top, "config", "--get", "remote.origin.url") or None)
     r.branches = [b for b in _git(top, "for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines() if b]
     ahead = _git(top, "rev-list", "--count", "@{upstream}..HEAD")
     r.unpushed_commits = int(ahead) if ahead.isdigit() else 0
@@ -251,36 +265,76 @@ def describe_repo(path: Path) -> Repo:
         r.common_dir = common
         r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())
     r.tree_bytes = _dir_bytes(top)
-    r.upstream, r.clone_url, r.remote_base = remote_base(top)
-    r.plan = "reference" if r.clone_url and r.remote_base else "bundle"
+    attrs = top / ".gitattributes"
+    r.uses_lfs = attrs.is_file() and "filter=lfs" in attrs.read_text(errors="replace")
+    plan = reference_plan(top)
+    r.upstream, r.remote_name, r.clone_url, r.remote_has, r.plan_note = (
+        plan["upstream"], plan["remote"], plan["url"], plan["has"], plan["note"])
+    r.plan = "reference" if r.clone_url and r.remote_has else "bundle"
     if r.plan == "reference":
-        n = _git(top, "rev-list", "--count", f"{r.remote_base}..HEAD")
+        n = _git(top, "rev-list", "--count", "--branches", "--tags", "HEAD", "--not", *r.remote_has)
         r.unpushed_commits = int(n) if n.isdigit() else r.unpushed_commits
+        r.unpushed_bytes = unpushed_bytes(top, r.remote_has)
     return r
 
 
-def remote_base(repo: Path) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """(upstream ref, clone URL, base commit) for re-cloning a repo instead of
-    shipping it: the newest commit of HEAD that its remote already has, by
-    the remote-tracking refs from the last fetch. Prefers the branch's
-    upstream, then the remote's default branch. (None, None, None) when the
-    repo has no remote with a usable URL."""
+def unpushed_bytes(repo: Path, remote_has: list) -> int:
+    """On-disk size of the objects a bundle of the unpushed work would carry."""
+    objs = subprocess.run(["git", "-C", str(repo), "rev-list", "--objects", "--branches", "--tags", "HEAD",
+                           "--not", *remote_has], capture_output=True).stdout
+    if not objs.strip():
+        return 0
+    sizes = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch-check=%(objectsize:disk)"],
+                           input=b"\n".join(line.split(b" ", 1)[0] for line in objs.splitlines()),
+                           capture_output=True).stdout
+    return sum(int(x) for x in sizes.split() if x.isdigit())
+
+
+def reference_plan(repo: Path) -> dict:
+    """Whether a repo can be re-cloned on the agent instead of shipped, and
+    what the remote already has.
+
+    Asks the remote itself (``git ls-remote``) rather than trusting the
+    remote-tracking refs, which can be stale: a branch force-pushed or deleted
+    since the last fetch would leave a bundle whose prerequisites the fresh
+    clone lacks. ``has`` lists the remote's current tips that exist here; a
+    bundle of everything not reachable from them is self-consistent with a
+    clone made now. Empty when the remote cannot be reached or shares nothing
+    with this repo, in which case the repo is shipped whole.
+    """
+    plan = {"upstream": None, "remote": None, "url": None, "has": [], "note": ""}
     upstream = _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}") or None
-    remote = upstream.split("/", 1)[0] if upstream else ("origin" if "origin" in _git(repo, "remote").split() else None)
+    remotes = _git(repo, "remote").split()
+    remote = upstream.split("/", 1)[0] if upstream and upstream.split("/", 1)[0] in remotes else (
+        "origin" if "origin" in remotes else (remotes[0] if remotes else None))
+    plan["upstream"], plan["remote"] = upstream, remote
     if not remote:
-        return None, None, None
-    url = redact_url(_git(repo, "remote", "get-url", remote))
+        plan["note"] = "no remote"
+        return plan
+    # The configured URL, not `remote get-url`, which applies this machine's
+    # insteadOf rewrites: the agent should get the URL as the user wrote it.
+    url = redact_url(_git(repo, "config", "--get", f"remote.{remote}.url"))
     if not url or url.startswith(("/", ".", "file:")):
-        return upstream, None, None  # a path on this machine cannot be cloned there
-    candidates = [upstream] if upstream else []
-    default = _git(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
-    candidates += [c for c in (default, f"{remote}/main", f"{remote}/master") if c]
-    for ref in candidates:
-        if _git(repo, "rev-parse", "--verify", "--quiet", ref):
-            base = _git(repo, "merge-base", "HEAD", ref)
-            if base:
-                return upstream, url, base
-    return upstream, url, None
+        plan["note"] = "its remote is a path on this machine"
+        return plan
+    plan["url"] = url
+    proc = subprocess.run(["git", "-C", str(repo), "ls-remote", "--heads", "--tags", remote],
+                          capture_output=True, text=True, errors="replace", timeout=60,
+                          env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": os.environ.get(
+                              "GIT_SSH_COMMAND", "ssh -o BatchMode=yes")})
+    if proc.returncode != 0:
+        plan["note"] = "its remote could not be reached from here"
+        return plan
+    tips = {line.split()[0] for line in proc.stdout.splitlines() if line.strip() and not line.endswith("^{}")}
+    plan["has"] = sorted(t for t in tips if _has_commit(repo, t))
+    if not plan["has"]:
+        plan["note"] = "it shares no commits with its remote"
+    return plan
+
+
+def _has_commit(repo: Path, sha: str) -> bool:
+    return subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+                          capture_output=True).returncode == 0
 
 
 def repos_for(cwds: Iterable[str], paths: Iterable[str], home: Path) -> list[Path]:

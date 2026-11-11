@@ -210,7 +210,7 @@ def test_stage_for_claude(machine, tmp_path):
     assert _git(web, "diff", "--name-only").split() == ["app.py"]
     assert (web / "notes.txt").read_text() == "untracked notes\n"
     assert not (web / ".env").exists()  # a secret file stays behind unless picked
-    assert _git(web, "remote", "get-url", "origin").strip() == "https://github.com/example/webapp.git"
+    assert _git(web, "config", "--get", "remote.origin.url").strip() == "https://github.com/example/webapp.git"
     assert "ahead 1" in _git(web, "status", "-sb").splitlines()[0]
     assert (home / "src/infra/app.py").exists()
 
@@ -783,17 +783,9 @@ def test_terminal_ctrl_c_does_not_reach_the_mount(machine, tmp_path):
 
 
 def _fake_github(machine, tmp_path, monkeypatch) -> dict:
-    """Bare repos standing in for github.com/example/*, holding what the
-    fixture's remote-tracking refs say the remote has. Returns the env that
-    points https://github.com/example/ at them (git's insteadOf)."""
-    remotes = tmp_path / "github"
-    for name in ("webapp", "infra"):
-        bare = remotes / f"{name}.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
-        subprocess.run(["git", "-C", str(machine[name]), "push", "-q", str(bare),
-                        "refs/remotes/origin/main:refs/heads/main"], check=True)
-        subprocess.run(["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
-    return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{remotes.as_uri()}/.insteadOf",
+    """The env that points https://github.com/example/ at the fixture's bare
+    repos, for a process whose HOME is not the fixture machine's."""
+    return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{Path(machine['github']).as_uri()}/.insteadOf",
             "GIT_CONFIG_VALUE_0": "https://github.com/example/"}
 
 
@@ -835,11 +827,11 @@ def test_repos_by_reference_restore_on_first_boot(machine, tmp_path, monkeypatch
     assert _git(web, "diff", "--cached", "--name-only").split() == ["README.md"]
     assert _git(web, "diff", "--name-only").split() == ["app.py"]
     assert (web / "notes.txt").read_text() == "untracked notes\n" and not (web / ".env").exists()
-    assert _git(web, "remote", "get-url", "origin").strip() == "https://github.com/example/webapp.git"
+    assert _git(web, "config", "--get", "remote.origin.url").strip() == "https://github.com/example/webapp.git"
     assert _git(agent_home / "src/infra", "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
 
     again = _restore(agent_home, env)  # idempotent
-    assert again.returncode == 0 and "already there" in again.stdout
+    assert again.returncode == 0 and "already restored" in again.stdout
 
 
 def test_worktrees_are_recreated_as_worktrees(machine, tmp_path, monkeypatch):
@@ -882,3 +874,109 @@ def test_ship_forces_the_whole_history(machine, tmp_path):
     assert (home / "src/webapp/.git").is_dir()
     assert not (home / ".handoff/repos").exists()
     assert not (home / ".handoff/restore_repos.py").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Regressions from the third review (repos by reference)
+
+
+def _commit(repo: Path, name: str, text: str, msg: str) -> str:
+    (repo / name).write_text(text)
+    subprocess.run(["git", "-C", str(repo), "add", name], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", msg], check=True, env={**os.environ, **world.ENV})
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def test_other_branches_and_tags_with_unpushed_work_survive(machine, tmp_path, monkeypatch):
+    infra = Path(machine["infra"])  # on main == origin/main, so HEAD has nothing unpushed
+    subprocess.run(["git", "-C", str(infra), "checkout", "-q", "-b", "experiment"], check=True)
+    exp = _commit(infra, "exp.txt", "exp", "experiment")
+    subprocess.run(["git", "-C", str(infra), "tag", "v-local"], check=True)
+    subprocess.run(["git", "-C", str(infra), "checkout", "-q", "main"], check=True)
+    rep = __import__("handoff").build_report([hz.find(machine["codex"])], None)
+    assert {r["path"]: r for r in rep["repos"]}[str(infra)]["unpushed_commits"] == 1
+    home, m = stage_all(machine, tmp_path, "claude", ship=False)
+    assert (home / ".handoff/repos/infra/unpushed.bundle").is_file()
+    agent = tmp_path / "agent"
+    shutil.copytree(home, agent, symlinks=True)
+    assert _restore(agent, _fake_github(machine, tmp_path, monkeypatch)).returncode == 0
+    r = agent / "src/infra"
+    assert _git(r, "rev-parse", "experiment").strip() == exp
+    assert _git(r, "rev-parse", "v-local^{commit}").strip() == exp
+    assert _git(r, "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+    assert not _git(r, "for-each-ref", "refs/handoff")
+
+
+def test_stale_tracking_ref_is_not_trusted(machine, tmp_path, monkeypatch):
+    # The local origin/main says the remote has commit A; the remote was since
+    # force-pushed to an unrelated history. Only what ls-remote shows counts.
+    web = Path(machine["webapp"])
+    bare = Path(machine["github"]) / "webapp.git"
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    _commit(other, "x.txt", "x", "rewritten history")
+    subprocess.run(["git", "-C", str(other), "push", "-q", "--force", str(bare), "main:main"], check=True)
+    plan = inv.reference_plan(web)
+    assert plan["has"] == [] and "shares no commits" in plan["note"]
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    assert (home / "src/webapp/.git").is_dir()  # falls back to shipping it whole
+
+
+def test_unreachable_remote_ships_whole(machine, tmp_path, monkeypatch):
+    (Path(machine["home"]) / ".gitconfig").unlink()  # github.com/example is not real
+    monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    assert (home / "src/webapp/.git").is_dir() and not (home / ".handoff/repos/webapp").exists()
+
+
+def test_failed_restore_leaves_nothing_and_retries(machine, tmp_path, monkeypatch):
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    agent = tmp_path / "agent"
+    shutil.copytree(home, agent, symlinks=True)
+    patch = agent / ".handoff/repos/webapp/unstaged.patch"
+    good = patch.read_bytes()
+    patch.write_bytes(b"not a patch\n")
+    env = _fake_github(machine, tmp_path, monkeypatch)
+    bad = _restore(agent, env)
+    assert bad.returncode == 1 and "src/webapp" in bad.stderr
+    assert not (agent / "src/webapp").exists() and not list((agent / "src").glob(".webapp*"))
+    patch.write_bytes(good)
+    ok = _restore(agent, env)
+    assert ok.returncode == 0, ok.stderr
+    assert "src/infra: already restored" in ok.stdout and "src/webapp: restored" in ok.stdout
+    assert _git(agent / "src/webapp", "diff", "--name-only").split() == ["app.py"]
+
+
+def test_restore_refuses_a_destination_with_something_in_it(machine, tmp_path, monkeypatch):
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    (home / "src/webapp").mkdir(parents=True)
+    (home / "src/webapp/mine.txt").write_text("mine")
+    proc = _restore(home, _fake_github(machine, tmp_path, monkeypatch))
+    assert proc.returncode == 1 and "already holds something" in proc.stderr
+    assert (home / "src/webapp/mine.txt").read_text() == "mine"
+
+
+def test_ssh_urls_keep_their_user():
+    assert inv.redact_url("ssh://git:pw@example.com/team/repo.git") == "ssh://git@example.com/team/repo.git"
+    assert inv.redact_url("git@github.com:team/repo.git") == "git@github.com:team/repo.git"
+    assert inv.redact_url("https://ghp_x@github.com/t/r.git") == "https://github.com/t/r.git"
+
+
+def test_report_ship_flag(machine):
+    proc = run_cli(machine, "report", "--json", "--session", machine["claude"], "--ship", str(machine["webapp"]))
+    assert proc.returncode == 0, proc.stderr
+    plans = {r["path"]: r["plan"] for r in json.loads(proc.stdout)["repos"]}
+    assert plans[str(machine["webapp"])] == "bundle"
+
+
+def test_picked_secret_in_a_reference_repo_is_recorded(machine, tmp_path):
+    env_id = f"file:{machine['webapp']}/.env"
+    _, m = stage_all(machine, tmp_path, "claude", creds=[env_id], ship=False)
+    assert env_id in m["credentials_copied"]
+
+
+def test_merge_collision_covers_reference_repos(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    dest = tmp_path / "existing-home"
+    (dest / "src/webapp").mkdir(parents=True)
+    assert "src/webapp" in sl.collisions(home, dest)
