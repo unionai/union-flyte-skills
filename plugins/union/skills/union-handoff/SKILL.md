@@ -192,23 +192,23 @@ the home, finished.
 python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name>
 ```
 
-This runs Union's agent launcher:
+This starts Union's agent launcher, the deployed task
+`agent-workspace-launcher.launch_agent_workspace`, with `identifier` and
+`home_locator`, through the flyte Python SDK (it uses the Python that the
+user's `flyte` CLI runs on; `--python` overrides). `system` / `production`
+is where each organization's launcher lives; pass `--project`, `--domain` or
+`--launcher-task` if the user's org differs, and `--config` for a flyte
+config other than the default. Add `--dry-run` to see what would be
+launched. Use a new name for `--identifier`: that creates the agent. It
+prints the agent's run, which stays running while the agent is on.
 
-```bash
-flyte run --project system --domain production \
-  deployed-task agent-workspace-launcher.launch_agent_workspace \
-  --identifier <agent-name> --home_locator <locator>
-```
-
-`system` / `production` is where each organization's launcher lives; pass
-`--project`, `--domain` or `--launcher-task` if the user's org differs. Add
-`--dry-run` to show the command first. Use a new name for `--identifier`:
-that creates the agent. The run `flyte` prints is the agent's; it stays
-running while the agent is on.
-
-A Claude agent with no login of its own uses the launching user's, and Union
-refuses to start it while another of their agents holds that login. If
-that happens, turn the other agent off, or give the new agent its own login.
+**The agent needs a Claude (or Codex) login of its own.** Without one it
+borrows the launching user's, and Union refuses the launch while another of
+their agents is using it ("already in use ... turn that one off first").
+Nothing is disturbed when that happens. Give the agent its own login first:
+a long-lived token from `claude setup-token`, stored as a secret for that
+agent, or sign it in from the console. Then launch again with the same
+identifier.
 
 In the Union console the same is **New agent**, with the locator in the
 optional **Home volume** field.

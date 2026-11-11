@@ -982,28 +982,43 @@ def test_merge_collision_covers_reference_repos(machine, tmp_path):
     assert "src/webapp" in sl.collisions(home, dest)
 
 
-def test_launch_command(machine, tmp_path):
-    flyte = tmp_path / "flyte"
-    flyte.write_text("#!/bin/sh\necho \"$@\" > \"$0.argv\"\necho 'Created Run: abc123'\n")
-    flyte.chmod(0o755)
-    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent"]
+def _fake_python(tmp_path: Path, body: str) -> Path:
+    """Stands in for the flyte CLI's Python: records the launch payload."""
+    py = tmp_path / "python"
+    py.write_text("#!/bin/sh\n" + body)
+    py.chmod(0o755)
+    return py
+
+
+def test_launch_uses_the_python_api(machine, tmp_path):
+    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\necho \'{"run": "r123", "url": "https://x/r123"}\'\n')
+    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent", "--python", str(py)]
     dry = run_cli(machine, *args, "--dry-run")
-    assert dry.returncode == 0
-    assert dry.stdout.strip() == ("flyte run --project system --domain production deployed-task "
-                                  "agent-workspace-launcher.launch_agent_workspace "
-                                  "--identifier my-agent --home_locator s3://b/v/x.metadata.json")
-    other = run_cli(machine, *args, "--project", "p", "--domain", "d", "--launcher-task", "t", "--dry-run")
-    assert other.stdout.split()[2:7] == ["--project", "p", "--domain", "d", "deployed-task"]
-    real = run_cli(machine, *args, "--flyte", str(flyte))
-    assert real.returncode == 0 and "Created Run: abc123" in real.stdout
-    assert Path(str(flyte) + ".argv").read_text().split()[-4:] == [
-        "--identifier", "my-agent", "--home_locator", "s3://b/v/x.metadata.json"]
+    assert dry.returncode == 0 and "agent-workspace-launcher.launch_agent_workspace in system/production" in dry.stdout
+    assert not Path(str(py) + ".payload").exists()
+    real = run_cli(machine, *args)
+    assert real.returncode == 0, real.stderr
+    assert json.loads(real.stdout.strip().splitlines()[-1])["run"] == "r123"
+    payload = json.loads(Path(str(py) + ".payload").read_text())
+    assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": "system",
+                       "domain": "production", "identifier": "my-agent",
+                       "locator": "s3://b/v/x.metadata.json", "config": None}
+
+
+def test_launch_snippet_is_valid_python():
+    import ast
+    ast.parse(__import__("handoff").LAUNCH_SNIPPET)
+
+
+def test_launch_finds_the_flyte_clis_python(tmp_path, monkeypatch):
+    cli = tmp_path / "flyte"
+    cli.write_text("#!/opt/somewhere/bin/python3.12\nprint('x')\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    assert __import__("handoff").flyte_python("flyte") == "/opt/somewhere/bin/python3.12"
 
 
 def test_launch_explains_an_agent_that_is_on(machine, tmp_path):
-    flyte = tmp_path / "flyte"
-    flyte.write_text("#!/bin/sh\necho 'AgentAlreadyOn: my-agent is on' >&2\nexit 1\n")
-    flyte.chmod(0o755)
-    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "my-agent", "--launcher-task", "t",
-                   "--project", "p", "--domain", "d", "--flyte", str(flyte))
+    py = _fake_python(tmp_path, "echo 'AgentAlreadyOn: my-agent is on' >&2\nexit 1\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "my-agent", "--python", str(py))
     assert proc.returncode == 1 and "Turn it off first" in proc.stderr

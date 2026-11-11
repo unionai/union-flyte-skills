@@ -311,10 +311,42 @@ def cmd_seal(args) -> int:
 LAUNCHER_TASK = "agent-workspace-launcher.launch_agent_workspace"
 
 
+# Runs inside the Python that has flyte-sdk (the user's flyte CLI's). The
+# Python API rather than `flyte run deployed-task`, whose CLI cannot pass the
+# launcher's enum input today.
+LAUNCH_SNIPPET = """
+import json, sys
+import flyte, flyte.remote as r
+a = json.loads(sys.argv[1])
+if a["config"]:
+    flyte.init_from_config(a["config"], project=a["project"], domain=a["domain"])
+else:
+    flyte.init_from_config(project=a["project"], domain=a["domain"])
+task = r.Task.get(a["task"], project=a["project"], domain=a["domain"], auto_version="latest")
+run = flyte.run(task, identifier=a["identifier"], home_locator=a["locator"])
+print(json.dumps({"run": run.name, "url": run.url}))
+"""
+
+
+def flyte_python(flyte_cli: str) -> str:
+    """The interpreter behind the user's `flyte` CLI, which has flyte-sdk."""
+    import shutil
+
+    path = shutil.which(flyte_cli)
+    if path:
+        try:
+            first = open(path, "rb").readline().decode(errors="replace")
+        except OSError:
+            first = ""
+        if first.startswith("#!") and "python" in first:
+            return first[2:].strip().split()[0]
+    return sys.executable
+
+
 def launch_command(args) -> list[str]:
-    return [args.flyte, "run", "--project", args.project, "--domain", args.domain,
-            "deployed-task", args.launcher_task,
-            "--identifier", args.identifier, "--home_locator", args.locator]
+    payload = {"task": args.launcher_task, "project": args.project, "domain": args.domain,
+               "identifier": args.identifier, "locator": args.locator, "config": args.config}
+    return [args.python or flyte_python(args.flyte), "-c", LAUNCH_SNIPPET, json.dumps(payload)]
 
 
 def cmd_launch(args) -> int:
@@ -322,22 +354,26 @@ def cmd_launch(args) -> int:
     a new agent; the identifier of an existing agent that is off gives that
     agent this home from now on (its later Turn ons continue from it). An
     agent that is on is refused by Union: turn it off first."""
-    import shlex
     import subprocess
 
     cmd = launch_command(args)
     if args.dry_run:
-        print(shlex.join(cmd))
+        print(f"{args.launcher_task} in {args.project}/{args.domain}: identifier={args.identifier} "
+              f"home_locator={args.locator} (via {cmd[0]})")
         return 0
-    print(f"$ {shlex.join(cmd)}", file=sys.stderr)
     proc = subprocess.run(cmd, text=True, capture_output=True)
     out = proc.stdout + proc.stderr
-    print(out[-3000:])
     if proc.returncode != 0:
+        print(out[-3000:], file=sys.stderr)
         if "AgentAlreadyOn" in out:
             print(f"Agent {args.identifier!r} is on. Turn it off first, or pick a new identifier.", file=sys.stderr)
+        elif "No module named 'flyte'" in out:
+            print("flyte-sdk is not importable there; pass --python <interpreter with flyte installed>.", file=sys.stderr)
         return proc.returncode
-    print(f"Started agent {args.identifier!r}. Its sessions wait under Done; Restart resumes each one.")
+    started = json.loads(proc.stdout.strip().splitlines()[-1])
+    print(json.dumps(started))
+    print(f"Started agent {args.identifier!r} (run {started['run']}). Its sessions wait under Done; "
+          "Restart resumes each one.", file=sys.stderr)
     return 0
 
 
@@ -398,8 +434,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--launcher-task", default=LAUNCHER_TASK, help=f"the deployed task that starts agents (default: {LAUNCHER_TASK})")
     p.add_argument("--project", default="system", help="the project the launcher lives in (default: system)")
     p.add_argument("--domain", default="production", help="the domain the launcher lives in (default: production)")
-    p.add_argument("--flyte", default="flyte", help="the flyte CLI to run")
-    p.add_argument("--dry-run", action="store_true", help="print the command only")
+    p.add_argument("--config", help="flyte config file (default: flyte's own lookup)")
+    p.add_argument("--flyte", default="flyte", help="the flyte CLI whose Python to use")
+    p.add_argument("--python", help="a Python with flyte-sdk installed (default: the flyte CLI's)")
+    p.add_argument("--dry-run", action="store_true", help="say what would be launched, launch nothing")
     p.set_defaults(func=cmd_launch)
     return ap
 
