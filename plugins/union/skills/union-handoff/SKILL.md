@@ -124,16 +124,12 @@ each choice means, using the report's `arrives as` column:
 
 Re-run the report with `--remote-harness <choice>` if it changes anything.
 
-## 5. Ask: a new agent, or merge into an existing one
+## 5. A new agent (merging into an existing one is not supported yet)
 
-- **New agent** (default): the handoff goes into a fresh volume, and a new
-  agent starts with it as its home.
-- **Merge** into an existing agent's home: its volume is forked, the handoff
-  is added, and a new version is sealed. That agent is then started from the
-  new version, and every later Turn on continues from there. Nothing already
-  in the home is overwritten; if it already has one of the handoff's repos
-  or sessions, `seal` stops before copying anything and lists them. Ask for
-  the agent home's artifact name.
+The handoff goes into a fresh volume, and a new agent starts with it as its
+home (step 7). **Merging into an existing agent's home is not supported in
+the Union console yet**: the console can only give a home volume to a new
+agent. If the user asks for a merge, say so, and offer a new agent instead.
 
 Also ask how much **memory** each restored session should get (default
 `2Gi`; pass `--memory`, and `--cpu` for CPUs, default 2). It is recorded with
@@ -173,9 +169,6 @@ user needs a Union login (`flyte` config for their org, project and domain).
 python3 scripts/handoff.py seal --staged ~/union-handoff/<name> \
   --volume <name> --artifact <name> --project <project> --domain <domain>
 
-# Merge into an existing agent's home
-python3 scripts/handoff.py seal --staged ~/union-handoff/<name> \
-  --merge-artifact <agent-home-artifact> --project <project> --domain <domain>
 ```
 
 Add `--dry-run` first to show the exact `flyte` command. `seal` mounts the
