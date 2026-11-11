@@ -5,7 +5,10 @@ be (`/root` by default; change it with `--remote-home`). `seal` copies that
 tree into the volume unchanged.
 
 ```
-src/<repo>/                       one per repo the sessions used
+src/<repo>/                       a repo shipped whole (no remote, or --ship)
+.handoff/repos/<repo>/            a repo travelling by reference: repo.json (remote,
+                                  branch, worktree), unpushed.bundle, *.patch, untracked/
+.handoff/restore_repos.py         re-clones those on first boot (run by setup.sh)
 .claude/projects/<slug>/<id>.jsonl  a resumable Claude session, re-keyed
 .claude/projects/<slug>/<id>/       its sub-agent transcripts and saved tool output
 .claude/projects/<slug>/memory/     the project's Claude memory
@@ -25,12 +28,24 @@ CLAUDE.md or AGENTS.md              a short note pointing at .handoff/ (appended
 
 ## Repos
 
-A git repo is rebuilt from a bundle of its local branches, remote-tracking
-branches and tags, so branch upstreams and "ahead by N" survive. HEAD is
-checked out as it was (branch or detached), the staged diff is applied to the
-index, the unstaged diff to the working tree, and untracked files are copied.
-Remotes keep their URLs, minus any `user:password@` part; nothing is fetched
-or pushed. Files that look like secrets (`.env`, `.npmrc`, `*.pem`, SSH keys,
+**By reference** (the default for a repo with a remote): nothing of the repo
+itself is copied. `.handoff/repos/<repo>/repo.json` records the remote URL
+(minus any `user:password@`), the branch, the commit, and which repo it is a
+worktree of. Shipped beside it is only what the remote lacks: a bundle of the
+commits after the newest one the remote has (by the last fetch), the staged
+and unstaged diffs, and the untracked files. On first boot
+`restore_repos.py` clones each main checkout, adds its worktrees with
+`git worktree add`, fetches the bundle, checks out the branch at the same
+commit, applies the staged diff to the index and the unstaged one to the
+working tree, and copies the untracked files. A repo already restored is
+skipped, so it can run again after a failed clone.
+
+**Shipped whole** (no remote, or `--ship`): rebuilt from a bundle of its
+local branches, remote-tracking branches and tags, so branch upstreams and
+"ahead by N" survive, with the same diffs and untracked files reapplied.
+
+Either way, remotes keep their URLs minus any `user:password@` part, and
+nothing is fetched or pushed during the handoff. Files that look like secrets (`.env`, `.npmrc`, `*.pem`, SSH keys,
 `credentials.json`, Terraform state, and similar) stay behind unless picked as
 credentials, here and in every other copy: trees, memory and skills. A
 symlink in a skill or memory directory that points outside it is not

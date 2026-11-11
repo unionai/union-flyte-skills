@@ -157,6 +157,14 @@ class Repo:
     tracked_secret_files: list[str] = field(default_factory=list)  # already committed: they travel in history
     submodules: int = 0
     worktree: bool = False  # a linked worktree (its .git is a file pointing elsewhere)
+    common_dir: Optional[str] = None  # worktrees of one repo share this
+    # How it travels: "reference" (re-cloned from its remote on first boot,
+    # with only what the remote lacks shipped), "bundle" (whole history
+    # shipped), or "tree" (copied as files).
+    plan: str = "tree"
+    clone_url: Optional[str] = None
+    remote_base: Optional[str] = None  # newest commit of HEAD that the remote has
+    upstream: Optional[str] = None
     flagged_in_patch: dict = field(default_factory=dict)
     sessions: list[str] = field(default_factory=list)
 
@@ -240,9 +248,39 @@ def describe_repo(path: Path) -> Repo:
     r.flagged_in_patch = scan_secret_values((staged + b"\n" + unstaged).decode(errors="replace").splitlines())
     common = _git(top, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if common:
+        r.common_dir = common
         r.history_bytes = _dir_bytes(Path(common) / "objects", skip=set())
     r.tree_bytes = _dir_bytes(top)
+    r.upstream, r.clone_url, r.remote_base = remote_base(top)
+    r.plan = "reference" if r.clone_url and r.remote_base else "bundle"
+    if r.plan == "reference":
+        n = _git(top, "rev-list", "--count", f"{r.remote_base}..HEAD")
+        r.unpushed_commits = int(n) if n.isdigit() else r.unpushed_commits
     return r
+
+
+def remote_base(repo: Path) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """(upstream ref, clone URL, base commit) for re-cloning a repo instead of
+    shipping it: the newest commit of HEAD that its remote already has, by
+    the remote-tracking refs from the last fetch. Prefers the branch's
+    upstream, then the remote's default branch. (None, None, None) when the
+    repo has no remote with a usable URL."""
+    upstream = _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}") or None
+    remote = upstream.split("/", 1)[0] if upstream else ("origin" if "origin" in _git(repo, "remote").split() else None)
+    if not remote:
+        return None, None, None
+    url = redact_url(_git(repo, "remote", "get-url", remote))
+    if not url or url.startswith(("/", ".", "file:")):
+        return upstream, None, None  # a path on this machine cannot be cloned there
+    candidates = [upstream] if upstream else []
+    default = _git(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
+    candidates += [c for c in (default, f"{remote}/main", f"{remote}/master") if c]
+    for ref in candidates:
+        if _git(repo, "rev-parse", "--verify", "--quiet", ref):
+            base = _git(repo, "merge-base", "HEAD", ref)
+            if base:
+                return upstream, url, base
+    return upstream, url, None
 
 
 def repos_for(cwds: Iterable[str], paths: Iterable[str], home: Path) -> list[Path]:

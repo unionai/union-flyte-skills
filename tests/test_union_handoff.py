@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -182,11 +183,15 @@ def test_claude_slug():
 # Stage
 
 
-def stage_all(machine, tmp_path, remote, *, creds=()):
+def stage_all(machine, tmp_path, remote, *, creds=(), ship=True):
+    """Stage every fixture session. ``ship`` sends whole repos (the bundle
+    path); ship=False lets repos with a remote travel by reference."""
     pool = hz.discover()
     sessions = [hz.find(machine[h], pool) for h in ("claude", "codex", "pi", "opencode", "hermes")]
     out = tmp_path / "out"
-    manifest = stg.stage(sessions, stg.StageOptions(out=out, remote_harness=remote, credentials=set(creds), log=lambda m: None))
+    repos = {str(machine["webapp"]), str(machine["infra"])} if ship else set()
+    manifest = stg.stage(sessions, stg.StageOptions(out=out, remote_harness=remote, credentials=set(creds),
+                                                    ship_repos=repos, log=lambda m: None))
     return out / "home", manifest
 
 
@@ -402,7 +407,7 @@ def test_unknown_harness_by_file(machine, tmp_path):
     stg.stage([s], stg.StageOptions(out=out, remote_harness="claude", log=lambda m: None))
     assert (out / "home/handoff/chat-jsonl/HANDOFF.md").exists()
     assert (out / "home/handoff/chat-jsonl/transcript.jsonl").exists()
-    assert (out / "home/src/webapp/.git").is_dir()
+    assert (out / "home/.handoff/repos/webapp/repo.json").is_file()  # webapp has a remote: by reference
 
 
 def test_non_git_cwd_and_empty_repo_travel_as_trees(machine, tmp_path):
@@ -771,3 +776,109 @@ def test_terminal_ctrl_c_does_not_reach_the_mount(machine, tmp_path):
     pid = int(err.split("pid ")[1].split(",")[0])
     os.kill(pid, 0)
     os.kill(pid, 9)
+
+
+# --------------------------------------------------------------------------- #
+# Repos by reference: re-cloned on first boot, only local work shipped
+
+
+def _fake_github(machine, tmp_path, monkeypatch) -> dict:
+    """Bare repos standing in for github.com/example/*, holding what the
+    fixture's remote-tracking refs say the remote has. Returns the env that
+    points https://github.com/example/ at them (git's insteadOf)."""
+    remotes = tmp_path / "github"
+    for name in ("webapp", "infra"):
+        bare = remotes / f"{name}.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(machine[name]), "push", "-q", str(bare),
+                        "refs/remotes/origin/main:refs/heads/main"], check=True)
+        subprocess.run(["git", "-C", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    return {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{remotes.as_uri()}/.insteadOf",
+            "GIT_CONFIG_VALUE_0": "https://github.com/example/"}
+
+
+def _restore(home: Path, env_extra: dict) -> subprocess.CompletedProcess:
+    env = {**os.environ, "HOME": str(home), **world.ENV, **env_extra}
+    return subprocess.run([sys.executable, str(home / ".handoff/restore_repos.py")], env=env, text=True, capture_output=True)
+
+
+def test_report_plans_repos_by_reference(machine):
+    rep = __import__("handoff").build_report([hz.find(machine["claude"])], None)
+    repos = {r["path"]: r for r in rep["repos"]}
+    web = repos[str(machine["webapp"])]
+    assert web["plan"] == "reference"
+    assert web["clone_url"] == "https://github.com/example/webapp.git"
+    assert web["unpushed_commits"] == 1
+
+
+def test_repos_by_reference_restore_on_first_boot(machine, tmp_path, monkeypatch):
+    env = _fake_github(machine, tmp_path, monkeypatch)
+    home, manifest = stage_all(machine, tmp_path, "claude", ship=False)
+    assert not (home / "src/webapp").exists()  # nothing of the repo itself is shipped
+    meta = home / ".handoff/repos/webapp"
+    spec = json.loads((meta / "repo.json").read_text())
+    assert spec["url"] == "https://github.com/example/webapp.git" and spec["branch"] == "feature/login"
+    assert (meta / "unpushed.bundle").is_file() and (meta / "staged.patch").is_file()
+    assert (meta / "untracked/notes.txt").is_file() and not (meta / "untracked/.env").exists()
+    assert not (home / ".handoff/repos/infra/unpushed.bundle").exists()  # infra has nothing unpushed
+    assert manifest["repos"][str(machine["webapp"])]["unpushed_commits"] == 1
+    setup = (home / ".handoff/setup.sh").read_text()
+    assert "restore_repos.py" in setup
+
+    agent_home = tmp_path / "agent-home"
+    shutil.copytree(home, agent_home, symlinks=True)
+    proc = _restore(agent_home, env)
+    assert proc.returncode == 0, proc.stderr
+    web = agent_home / "src/webapp"
+    assert _git(web, "rev-parse", "--abbrev-ref", "HEAD").strip() == "feature/login"
+    assert _git(web, "rev-parse", "HEAD").strip() == _git(Path(machine["webapp"]), "rev-parse", "HEAD").strip()
+    assert _git(web, "diff", "--cached", "--name-only").split() == ["README.md"]
+    assert _git(web, "diff", "--name-only").split() == ["app.py"]
+    assert (web / "notes.txt").read_text() == "untracked notes\n" and not (web / ".env").exists()
+    assert _git(web, "remote", "get-url", "origin").strip() == "https://github.com/example/webapp.git"
+    assert _git(agent_home / "src/infra", "rev-parse", "--abbrev-ref", "HEAD").strip() == "main"
+
+    again = _restore(agent_home, env)  # idempotent
+    assert again.returncode == 0 and "already there" in again.stdout
+
+
+def test_worktrees_are_recreated_as_worktrees(machine, tmp_path, monkeypatch):
+    env = _fake_github(machine, tmp_path, monkeypatch)
+    web = Path(machine["webapp"])
+    wt = web.parent / "webapp-wt"
+    subprocess.run(["git", "-C", str(web), "worktree", "add", "-q", "-b", "wt-branch", str(wt), "main"], check=True,
+                   env={**os.environ, **world.ENV})
+    (wt / "wt.txt").write_text("wt")
+    subprocess.run(["git", "-C", str(wt), "add", "wt.txt"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "worktree commit"], check=True, env={**os.environ, **world.ENV})
+    t = tmp_path / "s.jsonl"
+    t.write_text(json.dumps({"tool": {"command": f"cd {web} && make"}}) + "\n")
+    s = hz.find(f"file:{t}@{wt}")
+    out = tmp_path / "o"
+    stg.stage([s], stg.StageOptions(out=out, remote_harness="claude", log=lambda m: None))
+    spec = json.loads((out / "home/.handoff/repos/webapp-wt/repo.json").read_text())
+    assert spec["worktree_of"] == "src/webapp" and spec["branch"] == "wt-branch"
+    agent_home = tmp_path / "agent-home"
+    shutil.copytree(out / "home", agent_home, symlinks=True)
+    proc = _restore(agent_home, env)
+    assert proc.returncode == 0, proc.stderr
+    restored = agent_home / "src/webapp-wt"
+    assert (restored / ".git").is_file()  # a worktree of src/webapp, as it was
+    assert _git(restored, "rev-parse", "--abbrev-ref", "HEAD").strip() == "wt-branch"
+    assert (restored / "wt.txt").read_text() == "wt"
+    assert "webapp-wt" in _git(agent_home / "src/webapp", "worktree", "list")
+
+
+def test_restore_reports_a_clone_it_cannot_do(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    proc = _restore(home, {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+                           "GIT_CONFIG_KEY_0": "url.file:///nonexistent/.insteadOf",
+                           "GIT_CONFIG_VALUE_0": "https://github.com/example/"})
+    assert proc.returncode == 1 and "gh auth login" in proc.stderr
+
+
+def test_ship_forces_the_whole_history(machine, tmp_path):
+    home, manifest = stage_all(machine, tmp_path, "claude", ship=True)
+    assert (home / "src/webapp/.git").is_dir()
+    assert not (home / ".handoff/repos").exists()
+    assert not (home / ".handoff/restore_repos.py").exists()
