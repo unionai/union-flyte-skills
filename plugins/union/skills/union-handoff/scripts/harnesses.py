@@ -80,6 +80,9 @@ class Parsed:
     # Every turn in order as (role, text), for harnesses whose transcript lives
     # in a database, so a written handoff carries the whole conversation.
     turns: list = field(default_factory=list)
+    # Programs a shell reported not found in some tool output: a session that
+    # only checked for a tool did not use it.
+    not_found: set = field(default_factory=set)
 
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -199,6 +202,19 @@ def _text(content) -> str:
     return ""
 
 
+def _tool_text(content) -> str:
+    """The text of a tool result's content blocks."""
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def inventory_not_found(text: str) -> set:
+    import inventory  # local import: inventory has no harness knowledge
+
+    return inventory.not_found_names(text)
+
+
 def _short(text: str, n: int = 160) -> str:
     text = " ".join(text.split())
     return text if len(text) <= n else text[: n - 3] + "..."
@@ -290,6 +306,11 @@ def claude_parse(s: Session) -> Parsed:
                 t = _text(content)
                 if not _is_noise(t):
                     users.append(t)
+            if rec.get("type") == "user" and isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        out = block.get("content")
+                        p.not_found |= inventory_not_found(out if isinstance(out, str) else _tool_text(out))
             if rec.get("type") == "assistant":
                 t = _text(content)
                 if t and main:
@@ -411,6 +432,9 @@ def codex_parse(s: Session) -> Parsed:
             if payload.get("type") == "message" and payload.get("role") == "assistant":
                 p.last_assistant = _text(payload.get("content")) or p.last_assistant
             p.commands.extend(codex_commands(payload))
+            if payload.get("type") in ("function_call_output", "custom_tool_call_output", "local_shell_call_output"):
+                out = payload.get("output")
+                p.not_found |= inventory_not_found(out if isinstance(out, str) else json.dumps(out))
             if payload.get("type") == "custom_tool_call":
                 for lit in _JS_WORKDIR_RE.findall(str(payload.get("input") or "")):
                     try:

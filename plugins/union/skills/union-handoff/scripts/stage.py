@@ -18,6 +18,7 @@ Layout written under ``<out>/home`` (paths are relative to the agent's home):
                                  harness: the transcript plus HANDOFF.md
   .handoff/setup.sh              installs the tools the sessions used
   .handoff/manifest.json         what was staged, from where
+  .handoff/xdg-config/           what belongs in ~/.config (see RESERVED_ROOT_NAMES)
 """
 
 from __future__ import annotations
@@ -193,6 +194,8 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
     copied, skipped = [], []
     for rel in inv.untracked(src):
         s, d = src / rel, dest / rel
+        if inv.is_rebuilt_or_junk(rel, keep_git=True):
+            continue  # a virtualenv, node_modules or build output that is not ignored
         if inv.is_secret_path(rel) and str(s) not in picked_files:
             skipped.append(rel)
             continue
@@ -218,26 +221,32 @@ def stage_git_repo(src: Path, dest: Path, work: Path, picked_files: set[str]) ->
 
 
 def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[str],
-                        worktree_of: Optional[str], plan: dict) -> dict:
+                        worktree_of: Optional[str], plan: dict, all_branches: bool = False) -> dict:
     """Record a repo to be re-cloned from its remote on first boot, and ship
-    only what the remote lacks: every local branch, tag and the HEAD commit
-    not reachable from the remote's current tips (one bundle), the staged and
-    unstaged patches, and the untracked files. ~/.handoff/restore_repos.py
-    puts it back together. ``plan`` is inventory.reference_plan(src)."""
+    only what the remote lacks, in one bundle: the commits of HEAD and of the
+    branches checked out in its worktrees (with ``all_branches``, of every
+    local branch and tag) not reachable from the remote's current tips. Plus
+    the staged and unstaged patches and the untracked files.
+    ~/.handoff/restore_repos.py puts it back together. ``plan`` is
+    inventory.reference_plan(src)."""
     branch = inv._git(src, "symbolic-ref", "--quiet", "--short", "HEAD") or None
     head = inv._git(src, "rev-parse", "HEAD", check=True)
     meta.mkdir(parents=True)
     has = plan["has"]
-    unpushed = int(inv._git(src, "rev-list", "--count", "--branches", "--tags", "HEAD", "--not", *has) or 0)
+    refs = inv.shipped_refs(src, all_branches)
+    unpushed = int(inv._git(src, "rev-list", "--count", *refs, "--not", *has) or 0)
     bundle_bytes = 0
     if unpushed:
         bundle = meta / "unpushed.bundle"
-        _run(["git", "-C", str(src), "bundle", "create", str(bundle), "--branches", "--tags", "HEAD", "--not", *has])
+        _run(["git", "-C", str(src), "bundle", "create", str(bundle), *refs, "--not", *has])
         bundle_bytes = bundle.stat().st_size
+    left_behind = inv.branches_ahead(src, has, exclude=refs)
     branches = {}
     for line in inv._git(src, "for-each-ref", "--format=%(refname:short) %(objectname) %(upstream:short)",
                          "refs/heads").splitlines():
         name, sha, *up = line.split()
+        if name in left_behind:
+            continue  # its commits are not shipped, so the agent could not recreate it
         branches[name] = {"head": sha, "upstream": up[0] if up else None}
     staged = subprocess.run(["git", "-C", str(src), "diff", "--cached", "--binary"], capture_output=True).stdout
     unstaged = subprocess.run(["git", "-C", str(src), "diff", "--binary"], capture_output=True).stdout
@@ -247,6 +256,8 @@ def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[
     copied, skipped = [], []
     for rel in inv.untracked(src):
         s, d = src / rel, meta / "untracked" / rel
+        if inv.is_rebuilt_or_junk(rel, keep_git=True):
+            continue
         if inv.is_secret_path(rel) and str(s) not in picked_files:
             skipped.append(rel)
             continue
@@ -268,8 +279,10 @@ def stage_git_reference(src: Path, rel_dest: str, meta: Path, picked_files: set[
         "head": head,
         "worktree_of": worktree_of,
         "unpushed_commits": unpushed,
+        "branches_left_behind": left_behind,
         "bundle_bytes": bundle_bytes,
         "patch_bytes": len(staged) + len(unstaged),
+        "untracked_bytes": inv._dir_bytes(meta / "untracked", skip=set(), limit_files=None),
         "untracked_copied": len(copied),
         "secret_files_left_behind": skipped,
     }
@@ -288,7 +301,7 @@ def stage_tree(src: Path, dest: Path, picked_files: set[str]) -> dict:
         for n in names:
             full = os.path.join(d, n)
             rel = os.path.relpath(full, src)
-            if n in inv.SKIP_DIRS and n != ".git":
+            if (n in inv.SKIP_DIRS and n != ".git") or inv.JUNK_FILE_RE.match(n):
                 out.append(n)
             elif n == ".git" and os.path.isfile(full):
                 # A nested worktree or submodule: its .git points at the old
@@ -507,8 +520,56 @@ if have apt-get && [ "$(id -u)" = 0 ]; then apt-get update -qq || true; fi
 """
 
 
-def setup_script(tools: list[inv.Tool], restore_repos: bool = False) -> str:
+XDG_CONFIG_BLOCK = """# ~/.config travelled as ~/.handoff/xdg-config: a Union Volume reserves the
+# name .config at its root. Put it where this machine's tools look for it.
+if [ -d "$HOME/.handoff/xdg-config" ] && [ ! -e "$HOME/.handoff/xdg-config.done" ]; then
+  cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+  if [ -e "$cfg" ] && [ ! -d "$cfg" ]; then
+    cfg="$HOME/.xdg-config"
+    grep -qs 'XDG_CONFIG_HOME=' "$HOME/.bashrc" || echo 'export XDG_CONFIG_HOME="$HOME/.xdg-config"' >> "$HOME/.bashrc"
+    export XDG_CONFIG_HOME="$cfg"
+    echo "~/.config is not a directory here; using $cfg (XDG_CONFIG_HOME, exported in ~/.bashrc)"
+  fi
+  if mkdir -p "$cfg" && cp -Rn "$HOME/.handoff/xdg-config/." "$cfg/"; then
+    touch "$HOME/.handoff/xdg-config.done"
+  else
+    FAILED="$FAILED xdg-config"
+  fi
+fi
+"""
+
+
+def _ssh_https_block(hosts: list[str]) -> list[str]:
+    """Reach SSH remotes over HTTPS, for an agent that has no SSH key."""
+    lines = ["# These repos' remotes use SSH and no SSH key was copied, so reach them over",
+             "# HTTPS instead, signed in with the GitHub CLI."]
+    if "github.com" in hosts:
+        lines += [
+            "need gh 'apt_install gh'",
+            "gh config set git_protocol https 2>/dev/null || true",
+            "if gh auth status >/dev/null 2>&1; then",
+            "  gh auth setup-git",
+            "else",
+            '  echo "gh is not signed in: run gh auth login, then run this script again" >&2',
+            '  FAILED="$FAILED gh-login"',
+            "fi",
+            "for from in git@github.com: ssh://git@github.com/; do",
+            '  git config --global --get-all url.https://github.com/.insteadOf | grep -qxF "$from" \\',
+            '    || git config --global --add url.https://github.com/.insteadOf "$from"',
+            "done",
+        ]
+    for h in sorted(set(hosts) - {"github.com"}):
+        lines.append(f'echo "{h}: its repos use SSH and no SSH key was copied; sign in to {h} over HTTPS or add a key" >&2')
+    return lines + [""]
+
+
+def setup_script(tools: list[inv.Tool], restore_repos: bool = False, xdg_config: bool = False,
+                 ssh_hosts: tuple = ()) -> str:
     lines = [SETUP_HEADER]
+    if xdg_config:
+        lines.append(XDG_CONFIG_BLOCK)
+    if ssh_hosts:
+        lines += _ssh_https_block(list(ssh_hosts))
     if restore_repos:
         lines += [
             "# Re-clone the repos that travelled by reference and reapply their",
@@ -604,6 +665,7 @@ class StageOptions:
     exclude_repos: set[str] = field(default_factory=set)
     include_dirs: set[str] = field(default_factory=set)
     allow_transcript_secrets: bool = False
+    all_branches: bool = False  # ship every local branch's unpushed commits, not only HEAD's and worktrees'
     memory: str = "2Gi"
     cpu: str = "2"
     log: Callable[[str], None] = print
@@ -713,7 +775,11 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
                 primary = None  # its main checkout travels whole, so clone this one on its own
             opts.log(f"repo  {top} -> {remote_of[str(top)]} (re-cloned on first boot)")
             info = stage_git_reference(top, rel_dest, home / ".handoff" / "repos" / dest.name, picked_files, primary,
-                                       plans[str(top)])
+                                       plans[str(top)], opts.all_branches)
+            if info["branches_left_behind"]:
+                n = sum(info["branches_left_behind"].values())
+                opts.log(f"note  {top}: {n} unpushed commit(s) on {len(info['branches_left_behind'])} other branch(es)"
+                         " left behind (--all-branches ships them)")
             info["remote"] = remote_of[str(top)]
             repos[str(top)] = info
             continue
@@ -746,7 +812,8 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     # 2. Sessions.
     staged: list[StagedSession] = []
     used_names: set[str] = set()
-    tools_all = inv.tools_from([c for p in parsed.values() for c in p.commands], local_home)
+    not_found = set().union(*(p.not_found for p in parsed.values()))
+    tools_all = inv.tools_from([c for p in parsed.values() for c in p.commands], local_home, not_found)
     for s in sessions:
         p = parsed[s.key]
         base = slugify(s.title or f"{s.harness}-{s.id[:8]}")
@@ -786,7 +853,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
                 st.files.append(str((d / "extra").relative_to(home)) + "/")
             session_repos = {k: v for k, v in repos.items() if any(
                 c == k or c.startswith(k + "/") for c in (p.cwds or [s.cwd or ""]))}
-            tools = inv.tools_from(p.commands, local_home)
+            tools = inv.tools_from(p.commands, local_home, p.not_found)
             (d / "HANDOFF.md").write_text(handoff_note(st, p, pm, session_repos, tools))
             st.files.append(str((d / "HANDOFF.md").relative_to(home)))
         opts.log(f"session {s.key} -> {name} ({'resumable' if resumable else 'handoff note'})")
@@ -813,7 +880,9 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         src, dest = Path(c.path), home / c.rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
-            shutil.copytree(src, dest, symlinks=True)
+            # gcloud keeps its own virtualenv and logs beside the login.
+            shutil.copytree(src, dest, symlinks=True, ignore=lambda d, names: [
+                n for n in names if n in inv.SKIP_DIRS or n in ("virtenv", "logs") or inv.JUNK_FILE_RE.match(n)])
         else:
             shutil.copy2(src, dest)
             dest.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -823,10 +892,18 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     # 5. Setup script, finished records, notes.
     hdir = home / ".handoff"
     hdir.mkdir(exist_ok=True)
+    relocated = relocate_reserved(home)
+    for name, where in relocated.items():
+        opts.log(f"note  ~/{name} is staged as ~/{where}: a Union Volume reserves {name} at its root;"
+                 " setup.sh puts it back")
     restores = any(r.get("mode") == "reference" for r in repos.values())
     if restores:
         shutil.copy2(Path(__file__).with_name("restore_repos.py"), hdir / "restore_repos.py")
-    (hdir / "setup.sh").write_text(setup_script(tools_all, restore_repos=restores))
+    ssh_key_copied = any(c.startswith("ssh:") for c in copied_creds)
+    ssh_hosts = sorted({h for r in repos.values() if r.get("mode") == "reference"
+                        for h in [inv.ssh_host(r.get("clone_url"))] if h}) if not ssh_key_copied else []
+    (hdir / "setup.sh").write_text(setup_script(tools_all, restore_repos=restores, xdg_config=".config" in relocated,
+                                                ssh_hosts=tuple(ssh_hosts)))
     (hdir / "setup.sh").chmod(0o755)
 
     now = time.time()
@@ -851,9 +928,14 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
         "repos": repos,
         "sessions": [
             {"name": st.name, "source": st.source.key, "title": st.source.title, "remote_cwd": st.remote_cwd,
-             "resumable": st.resumable, "resume_id": st.resume_id, "files": st.files}
+             "resumable": st.resumable, "resume_id": st.resume_id, "files": st.files,
+             # What refresh_transcripts needs to copy the transcript again.
+             "harness": st.source.harness, "id": st.source.id, "source_path": str(st.source.path),
+             "extra": [str(e) for e in st.source.extra]}
             for st in staged
         ],
+        "allow_transcript_secrets": opts.allow_transcript_secrets,
+        "relocated": relocated,
         "credentials_copied": copied_creds,
         "transcript_secrets": found,
         "extras": extras,
@@ -863,7 +945,123 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     shutil.rmtree(work, ignore_errors=True)
     manifest["home"] = str(home)
     manifest["bytes"] = inv._dir_bytes(home, skip=set(), limit_files=None)
+    # What the report estimated: transcripts plus what each repo ships.
+    manifest["estimate_bytes"] = sum(s.size_bytes for s in sessions) + sum(
+        r.get("bundle_bytes", 0) + r.get("patch_bytes", 0) + r.get("untracked_bytes", 0) + r.get("bytes", 0)
+        for r in repos.values())
+    if manifest["bytes"] > 3 * manifest["estimate_bytes"] + 20 * 1024 * 1024:
+        manifest["largest"] = largest_dirs(home)
+        opts.log(f"WARNING: staged {manifest['bytes'] // 1024 // 1024} MB, far above the"
+                 f" {manifest['estimate_bytes'] // 1024 // 1024} MB estimated. Largest directories:")
+        for rel, n in manifest["largest"]:
+            opts.log(f"  {n // 1024 // 1024:>6} MB  {rel}")
+        opts.log("Look for something that should not travel (a cache, a virtualenv, build output) before sealing.")
     return manifest
+
+
+def largest_dirs(home: Path, depth: int = 3, top: int = 5) -> list[tuple[str, int]]:
+    """The biggest directories in a staged home, ``depth`` levels down."""
+    sizes: dict[str, int] = {}
+    for dirpath, _, filenames in os.walk(home):
+        rel = Path(dirpath).relative_to(home).parts[:depth]
+        if not rel:
+            continue
+        key = "/".join(rel)
+        for f in filenames:
+            try:
+                sizes[key] = sizes.get(key, 0) + os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                pass
+    return sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:top]
+
+
+# A Union Volume is a JuiceFS file system, which exposes these names at its
+# root as virtual, read-only entries: nothing can be written under them. A
+# home that has one (most have ~/.config) is staged under another name, and
+# setup.sh puts it where the tools look.
+RESERVED_ROOT_NAMES = {".config", ".stats", ".accesslog", ".trash", ".control"}
+RELOCATED_TO = {".config": ".handoff/xdg-config"}
+
+
+def reserved_in(home: Path) -> list[str]:
+    """Top-level names in a staged home that a Union Volume reserves."""
+    return sorted(n for n in RESERVED_ROOT_NAMES if os.path.lexists(home / n))
+
+
+def relocate_reserved(home: Path) -> dict[str, str]:
+    """Move each reserved top-level name out of the way. Returns name -> new path."""
+    moved = {}
+    for name in reserved_in(home):
+        where = RELOCATED_TO.get(name, f".handoff/reserved/{name.lstrip('.')}")
+        dest = home / where
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            _copy_missing(home / name, dest)
+            shutil.rmtree(home / name)
+        else:
+            (home / name).rename(dest)
+        moved[name] = where
+    return moved
+
+
+def refresh_transcripts(home: Path, log: Callable[[str], None] = print) -> list[str]:
+    """Copy each staged session's transcript again from its source, with the
+    same cwd rewrite, so a session that kept going after ``stage`` arrives
+    with its whole conversation. Refuses, writing nothing, if a transcript
+    now holds credential-looking values and staging did not allow that."""
+    mf = home / ".handoff" / "manifest.json"
+    manifest = json.loads(mf.read_text())
+    pm = PathMap()
+    for local, remote in manifest["path_map"].items():
+        pm.add(local, remote)
+    todo = []
+    for entry in manifest["sessions"]:
+        src = Path(entry.get("source_path") or "")
+        if not src.is_file() or src.suffix == ".db" or not entry.get("files"):
+            continue  # gone, a database, or staged before this was recorded
+        s = hz.Session(entry["harness"], entry["id"], src, None, extra=[Path(e) for e in entry.get("extra", [])])
+        todo.append((entry, s))
+    if not manifest.get("allow_transcript_secrets"):
+        found = {s.key: transcript_secrets(s) for _, s in todo}
+        found = {k: v for k, v in found.items() if v}
+        if found:
+            raise SystemExit("Since staging, these transcripts gained values that look like credentials:\n"
+                             + "\n".join(f"  {k}: " + ", ".join(f"{n} {kind}" for kind, n in v.items())
+                                         for k, v in found.items())
+                             + "\nNothing was refreshed. Rotate them, or re-stage with --allow-transcript-secrets.")
+    done = []
+    for entry, s in todo:
+        first = home / entry["files"][0]
+        if entry["resumable"] and s.harness == "claude":
+            tmp = first.with_name(first.name + ".refresh")
+            rewrite_jsonl(s.path, tmp, pm)
+            os.replace(tmp, first)
+            for sidecar in s.extra:
+                for f in sidecar.rglob("*"):
+                    if f.is_file():
+                        out = first.parent / sidecar.name / f.relative_to(sidecar)
+                        if f.suffix == ".jsonl":
+                            rewrite_jsonl(f, out, pm)
+                        else:
+                            out.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(f, out)
+        elif entry["resumable"] and s.harness == "codex":
+            tmp = first.with_name(first.name + ".refresh")
+            rewrite_jsonl(s.path, tmp, pm)
+            os.replace(tmp, first)
+        elif first.name.startswith("transcript"):
+            tmp = first.with_name(first.name + ".refresh")
+            with tmp.open("w") as fh:
+                fh.writelines(hz.iter_text_lines(s.path))
+            os.replace(tmp, first)
+        else:
+            continue
+        done.append(entry["name"])
+        log(f"refreshed {entry['source']} -> ~/{entry['files'][0]}")
+    manifest["refreshed_at"] = time.time()
+    mf.write_text(json.dumps(manifest, indent=1) + "\n", errors="backslashreplace")
+    return done
+
 
 
 def _rel(path: str, rh: str) -> Optional[str]:
@@ -901,7 +1099,8 @@ def _readme(staged: list[StagedSession], repos: dict, pm: PathMap, creds: list[s
             lines.append(f"  - left behind (secret-looking, not picked): {', '.join(info['secret_files_left_behind'])}")
     lines += ["", "## Credentials", ""]
     lines.append("Copied: " + (", ".join(f"`{c}`" for c in creds) if creds else "none. Sign in again where a tool needs it."))
-    lines += ["", "## Tools", "", "Run `bash ~/.handoff/setup.sh` once. Review it first."]
+    lines += ["", "## Tools", "", "Run `bash ~/.handoff/setup.sh` once. Review it first. It also puts back what",
+              "could not travel under its own name (`~/.handoff/xdg-config` is `~/.config`)."]
     return "\n".join(lines) + "\n"
 
 
@@ -916,37 +1115,48 @@ def _db_transcript(s: hz.Session, p: hz.Parsed) -> str:
 
 def _copy_missing(src: Path, dest: Path, skipped: Optional[list] = None) -> int:
     """Copy a tree without overwriting anything already staged, and without
-    secret-looking files or symlinks that point outside it."""
+    secret-looking files, symlinks that point outside it, or what is rebuilt
+    rather than moved (virtualenvs, node_modules, build output, OS junk)."""
     n = 0
     root = src.resolve()
-    for f in src.rglob("*"):
-        rel = f.relative_to(src)
-        if any((src / parent).is_symlink() for parent in rel.parents if str(parent) != "."):
-            continue  # under a symlinked directory, which is recreated as a link below
-        if f.is_symlink():
-            target = f.resolve()
-            if target != root and root not in target.parents:
+    for dirpath, dirnames, filenames in os.walk(src):
+        d = Path(dirpath)
+        keep = []
+        for name in dirnames:
+            if (d / name).is_symlink():
+                filenames.append(name)  # recreated as a link below, never followed
+            elif not inv.is_rebuilt_or_junk(str((d / name).relative_to(src))):
+                keep.append(name)
+        dirnames[:] = keep
+        for name in filenames:
+            f = d / name
+            rel = f.relative_to(src)
+            if inv.is_rebuilt_or_junk(str(rel)):
+                continue
+            if f.is_symlink():
+                target = f.resolve()
+                if target != root and root not in target.parents:
+                    if skipped is not None:
+                        skipped.append(str(f))  # points outside: may be a login file
+                    continue
+                out = dest / rel
+                if not os.path.lexists(out):
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    os.symlink(os.readlink(f), out)
+                    n += 1
+                continue
+            if not f.is_file():
+                continue
+            if inv.is_secret_path(str(rel)):
                 if skipped is not None:
-                    skipped.append(str(f))  # points outside: may be a login file
+                    skipped.append(str(f))
                 continue
             out = dest / rel
-            if not os.path.lexists(out):
-                out.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(os.readlink(f), out)
-                n += 1
-            continue
-        if not f.is_file():
-            continue
-        if inv.is_secret_path(str(rel)):
-            if skipped is not None:
-                skipped.append(str(f))
-            continue
-        out = dest / rel
-        if out.exists():
-            continue
-        out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, out)
-        n += 1
+            if out.exists():
+                continue
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, out)
+            n += 1
     return n
 
 

@@ -17,12 +17,28 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-# Directories that are rebuilt, not moved, when copying a tree that is not a
-# git repo (and that never count toward its size).
+# Directories that are rebuilt, not moved: left out of every copy (trees,
+# untracked files, memory, skills) and never counted toward a size. A
+# virtualenv or node_modules is built for this machine's OS and would not run
+# on the agent anyway.
 SKIP_DIRS = {
     ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
     ".ruff_cache", ".tox", ".next", "dist", "build", "target", ".gradle", ".cache",
 }
+
+# Files the OS writes beside real ones: macOS Finder state and AppleDouble
+# ("._name") files, which carry extended attributes on filesystems without them.
+JUNK_FILE_RE = re.compile(r"^(\._.*|\.DS_Store)$")
+
+
+def is_rebuilt_or_junk(rel: str, keep_git: bool = False) -> bool:
+    """Whether a relative path is under a rebuilt directory (a virtualenv,
+    node_modules, build output, ...) or is an OS junk file."""
+    parts = Path(rel).parts
+    if not parts:
+        return False
+    skip = SKIP_DIRS - {".git"} if keep_git else SKIP_DIRS
+    return any(p in skip for p in parts[:-1]) or parts[-1] in skip or bool(JUNK_FILE_RE.match(parts[-1]))
 
 # Filenames that conventionally hold secrets. Every copy path (untracked files,
 # trees, memory, skills) leaves a match behind unless the user picks it by id.
@@ -127,6 +143,23 @@ def redact_url(url: Optional[str]) -> Optional[str]:
     return url.replace(m.group(0), scheme, 1)
 
 
+_SCP_LIKE_RE = re.compile(r"^(?:[^@/\s]+@)?([^:/\s]+):(?!//)")
+
+
+def ssh_host(url: Optional[str]) -> Optional[str]:
+    """The host of an SSH remote (``git@host:org/repo``, ``ssh://git@host/...``),
+    or None for any other kind of URL."""
+    if not url:
+        return None
+    m = re.match(r"^(?:ssh|git\+ssh)://(?:[^@/]+@)?([^:/]+)", url, re.I)
+    if m:
+        return m.group(1).lower()
+    if "://" in url:
+        return None
+    m = _SCP_LIKE_RE.match(url)
+    return m.group(1).lower() if m else None
+
+
 def _git(repo: Path, *args: str, check: bool = False) -> str:
     # surrogateescape: repo paths and filenames need not be UTF-8.
     proc = subprocess.run(["git", "-C", str(repo), *args], text=True, errors="surrogateescape", capture_output=True)
@@ -176,7 +209,13 @@ class Repo:
     remote_name: Optional[str] = None
     remote_has: list = field(default_factory=list)  # commits the remote has now (git ls-remote), present here
     upstream: Optional[str] = None
-    unpushed_bytes: int = 0  # objects in the local branches and tags the remote lacks
+    unpushed_bytes: int = 0  # objects in the shipped refs the remote lacks
+    # Of unpushed_commits, how many are on the checked-out branch (HEAD), and
+    # the other local branches with commits the remote lacks: those travel
+    # only with --all-branches, except branches checked out in a worktree.
+    head_unpushed: int = 0
+    other_branches_unpushed: dict = field(default_factory=dict)  # branch -> commits not on the remote
+    all_branches: bool = False
     uses_lfs: bool = False
     plan_note: str = ""
     flagged_in_patch: dict = field(default_factory=dict)
@@ -223,7 +262,7 @@ def tree_secret_files(root: Path) -> list[str]:
     return sorted(out)
 
 
-def describe_repo(path: Path) -> Repo:
+def describe_repo(path: Path, all_branches: bool = False) -> Repo:
     top = git_toplevel(path)
     if top is None:
         r = Repo(path=str(path), git=False, tree_bytes=_dir_bytes(path))
@@ -244,6 +283,8 @@ def describe_repo(path: Path) -> Repo:
         r.tree_bytes = _dir_bytes(top)
         return r
     for f in untracked(top):
+        if is_rebuilt_or_junk(f, keep_git=True):
+            continue  # not copied: see stage_git_*
         if is_secret_path(f):
             r.secret_files.append(f)
         r.untracked_files += 1
@@ -271,16 +312,55 @@ def describe_repo(path: Path) -> Repo:
     r.upstream, r.remote_name, r.clone_url, r.remote_has, r.plan_note = (
         plan["upstream"], plan["remote"], plan["url"], plan["has"], plan["note"])
     r.plan = "reference" if r.clone_url and r.remote_has else "bundle"
+    r.all_branches = all_branches
     if r.plan == "reference":
-        n = _git(top, "rev-list", "--count", "--branches", "--tags", "HEAD", "--not", *r.remote_has)
+        refs = shipped_refs(top, all_branches)
+        n = _git(top, "rev-list", "--count", *refs, "--not", *r.remote_has)
         r.unpushed_commits = int(n) if n.isdigit() else r.unpushed_commits
-        r.unpushed_bytes = unpushed_bytes(top, r.remote_has)
+        n = _git(top, "rev-list", "--count", "HEAD", "--not", *r.remote_has)
+        r.head_unpushed = int(n) if n.isdigit() else 0
+        r.other_branches_unpushed = branches_ahead(top, r.remote_has, exclude=refs)
+        r.unpushed_bytes = unpushed_bytes(top, r.remote_has, refs)
     return r
 
 
-def unpushed_bytes(repo: Path, remote_has: list) -> int:
+def worktree_branches(repo: Path) -> list[str]:
+    """Branches checked out in any worktree of ``repo``, including its own."""
+    out = []
+    for line in _git(repo, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("branch refs/heads/"):
+            out.append(line[len("branch "):])
+    return out
+
+
+def shipped_refs(repo: Path, all_branches: bool = False) -> list[str]:
+    """The refs whose unpushed commits travel with a repo that is re-cloned:
+    by default HEAD and the branches checked out in its worktrees; with
+    ``all_branches``, every local branch and tag too."""
+    if all_branches:
+        return ["--branches", "--tags", "HEAD"]
+    return ["HEAD"] + [b for b in worktree_branches(repo) if b]
+
+
+def branches_ahead(repo: Path, remote_has: list, exclude: list[str] = ()) -> dict:
+    """Local branches with commits the remote lacks, and how many, leaving
+    out the refs in ``exclude`` (and every branch when that is all of them)."""
+    if "--branches" in exclude:
+        return {}
+    out = {}
+    for line in _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads").splitlines():
+        if not line or line in exclude:
+            continue
+        n = _git(repo, "rev-list", "--count", line, "--not", *exclude, *remote_has)
+        if n.isdigit() and int(n):
+            out[line[len("refs/heads/"):]] = int(n)
+    return out
+
+
+def unpushed_bytes(repo: Path, remote_has: list, refs: Optional[list] = None) -> int:
     """On-disk size of the objects a bundle of the unpushed work would carry."""
-    objs = subprocess.run(["git", "-C", str(repo), "rev-list", "--objects", "--branches", "--tags", "HEAD",
+    refs = refs or ["--branches", "--tags", "HEAD"]
+    objs = subprocess.run(["git", "-C", str(repo), "rev-list", "--objects", *refs,
                            "--not", *remote_has], capture_output=True).stdout
     if not objs.strip():
         return 0
@@ -377,7 +457,7 @@ def has_commits(repo: Path) -> bool:
 # Shell builtins and the base system every Linux image already has; counting
 # them would bury the tools that matter.
 BASE_COMMANDS = set("""
-alias awk basename bash break cat cd chmod chown clear command comm cp curl cut date dd declare df diff dirname du echo
+alias awk basename bash break cat cd chmod hash whereis chown clear command comm cp curl cut date dd declare df diff dirname du echo
 egrep env eval exec exit export expr false fgrep file find for fi grep gunzip gzip head history hostname id if in jobs
 kill less let ln local ls mkdir mktemp more mv nohup popd printf ps pushd pwd read readlink realpath return rm rmdir sed
 seq set sh shift sleep sort source stat sudo tail tar tee test then time timeout touch tr trap true type ulimit umask
@@ -511,9 +591,15 @@ def split_segments(command: str) -> list[str]:
     return [seg.strip() for seg in segments if seg.strip()]
 
 
-def command_names(command: str) -> list[str]:
-    """The program each simple command in a shell command line runs."""
-    names = []
+# Asking whether a program exists, or which version it is, is not using it.
+_PROBE_ARGS = ({"--version"}, {"-V"}, {"version"}, {"--help"}, {"-h"}, {"help"})
+
+
+def command_invocations(command: str) -> list[tuple[str, list[str]]]:
+    """(program, arguments) for each simple command in a shell command line.
+    ``command -v X`` and ``command -V X`` are probes, not runs of X, and are
+    left out (as are ``which``/``type``/``hash X``, which run only themselves)."""
+    out = []
     for segment in split_segments(command):
         try:
             words = shlex.split(segment)
@@ -523,6 +609,8 @@ def command_names(command: str) -> list[str]:
         while i < len(words):
             w = words[i]
             prev = words[i - 1] if i else ""
+            if w == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
+                break  # a probe: `command -v X` asks whether X exists
             if _ASSIGN_RE.match(w) or w in _WRAPPERS:
                 i += 1
                 continue
@@ -534,9 +622,24 @@ def command_names(command: str) -> list[str]:
                 continue
             name = os.path.basename(w)
             if re.match(r"^[A-Za-z0-9][\w.+-]*$", name):
-                names.append(name)
+                out.append((name, words[i + 1:]))
             break
-    return names
+    return out
+
+
+def command_names(command: str) -> list[str]:
+    """The program each simple command in a shell command line runs."""
+    return [name for name, _ in command_invocations(command)]
+
+
+# How shells report a program that is not there: bash ("x: command not
+# found"), zsh ("command not found: x") and dash ("x: not found").
+_NOT_FOUND_RE = re.compile(r"command not found: ([\w.+-]+)|([\w.+-]+): command not found(?!:)|\b\d+: ([\w.+-]+): not found")
+
+
+def not_found_names(text: str) -> set[str]:
+    """Programs a shell said it could not find, in some tool output."""
+    return {next(g for g in m.groups() if g) for m in _NOT_FOUND_RE.finditer(text or "")}
 
 
 def command_dirs(command: str, cwd: Optional[str] = None) -> list[str]:
@@ -641,13 +744,30 @@ def linux_install_line(tool: Tool) -> Optional[str]:
     return f"# TODO {tool.name}: not found locally, so how to install it is unknown"
 
 
-def tools_from(commands: Iterable[str], home: Path) -> list[Tool]:
+def tools_from(commands: Iterable[str], home: Path, not_found: Iterable[str] = ()) -> list[Tool]:
+    """The programs the commands ran, with how to install each on Linux.
+
+    Left out: the base system, probes (``command -v X``, ``X --version``
+    when that is all a session did with X), and programs a shell reported
+    not found that are not installed here either: the session only checked
+    for them."""
     counts: Counter = Counter()
+    real: set[str] = set()
     for c in commands:
-        counts.update(n for n in command_names(c) if n not in BASE_COMMANDS)
+        for name, args in command_invocations(c):
+            if name in BASE_COMMANDS:
+                continue
+            counts[name] += 1
+            if set(args) not in _PROBE_ARGS:
+                real.add(name)
+    missing = set(not_found)
     out = []
     for name, count in counts.most_common():
         path = shutil.which(name)
+        if name not in real:
+            continue  # only ever asked for its version or help
+        if path is None and name in missing:
+            continue  # the shell said it was not there, and it is not here either
         if path is None and name not in KNOWN_TOOLS and not re.match(r"^[a-z][a-z0-9_+-]*$", name):
             continue  # not a program anyone could install: a stray word, a path, a variable
         by, pkg = _installed_by(name, path, home)
@@ -704,28 +824,75 @@ AGENT_LOGINS = [
 FLAGGED_ENV_NAME_RE = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)", re.I)
 
 
+# Where a tool reads its credentials from when an environment variable says
+# so, instead of the default path under home: (credential id, variable, file
+# inside the directory the variable names, or "" when it names the file).
+ENV_LOCATIONS = [
+    ("gh", "GH_CONFIG_DIR", "hosts.yml"),
+    ("aws", "AWS_SHARED_CREDENTIALS_FILE", ""),
+    ("aws-config", "AWS_CONFIG_FILE", ""),
+    ("gcloud", "CLOUDSDK_CONFIG", "."),
+]
+
+
+def _gh_holds_token(path: Path) -> bool:
+    """Whether a gh hosts.yml holds a token. Recent gh keeps it in the system
+    keyring (the macOS Keychain) and writes only the user name here. Only
+    the key's presence is read, never its value."""
+    try:
+        return any(re.match(r"^\s*oauth_token\s*:\s*\S", line) for line in path.read_text(errors="replace").splitlines())
+    except OSError:
+        return False
+
+
 def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = None) -> tuple[list[Credential], list[str]]:
     """Credential files found, and the NAMES of secret-looking environment
-    variables (values are never read into the report)."""
+    variables (values are never read into the report).
+
+    A tool pointed elsewhere by its environment variable (AWS_CONFIG_FILE,
+    AWS_SHARED_CREDENTIALS_FILE, CLOUDSDK_CONFIG, GH_CONFIG_DIR or
+    XDG_CONFIG_HOME, KUBECONFIG) is read from there, since that is the file
+    it actually uses; it still lands at the standard path in the agent."""
+    env = os.environ if env is None else env
+    overrides: dict[str, tuple[Path, str]] = {}
+    for cid, var, inner in ENV_LOCATIONS:
+        if env.get(var):
+            base = Path(env[var]).expanduser()
+            overrides[cid] = (base / inner if inner and inner != "." else base, var)
+    if "gh" not in overrides and env.get("XDG_CONFIG_HOME"):
+        overrides["gh"] = (Path(env["XDG_CONFIG_HOME"]).expanduser() / "gh" / "hosts.yml", "XDG_CONFIG_HOME")
     found: list[Credential] = []
     for cid, kind, rel, advice in CREDENTIAL_PATHS:
-        p = home / rel
-        if p.exists():
-            found.append(Credential(cid, kind, str(p), rel, advice))
+        p, var = overrides.get(cid, (home / rel, ""))
+        if not p.exists():
+            continue
+        c = Credential(cid, kind + (f" (from ${var})" if var else ""), str(p), rel, advice)
+        if cid == "gh" and not _gh_holds_token(p):
+            c.kind = "GitHub CLI login, token kept in the system keyring"
+            c.advice = "this copies no token (gh keeps it in the keyring, not the file); run `gh auth login` in the agent"
+            c.copyable = False
+        found.append(c)
     ssh = home / ".ssh"
     if ssh.is_dir():
         for key in sorted(ssh.glob("id_*")):
             if key.suffix != ".pub" and key.is_file():
                 found.append(Credential(f"ssh:{key.name}", "SSH private key", str(key), f".ssh/{key.name}",
                                         "add a deploy key or use HTTPS with a token instead"))
-    kubeconfig = (env or os.environ).get("KUBECONFIG")
+    kubeconfig = env.get("KUBECONFIG")
     if kubeconfig:
-        for k in kubeconfig.split(os.pathsep):
-            kp = Path(k).expanduser()
-            if kp.is_file() and kp != home / ".kube/config":
-                rel = str(kp.relative_to(home)) if kp.is_relative_to(home) else None
-                found.append(Credential(f"kubeconfig:{kp.name}", "Kubernetes contexts (KUBECONFIG)", str(kp), rel,
-                                        "prefer a scoped kubeconfig secret"))
+        # The first file lands at the standard ~/.kube/config; any others
+        # beside it, and the agent's KUBECONFIG must then list them.
+        files = [Path(k).expanduser() for k in kubeconfig.split(os.pathsep) if k]
+        files = [k for k in files if k.is_file()]
+        found = [c for c in found if c.id != "kubeconfig"] if files else found
+        for i, kp in enumerate(files):
+            if i == 0:
+                found.append(Credential("kubeconfig", "Kubernetes contexts (from $KUBECONFIG)", str(kp), ".kube/config",
+                                        "copying gives the agent your cluster access; prefer a scoped kubeconfig secret"))
+            else:
+                found.append(Credential(f"kubeconfig:{kp.name}", "Kubernetes contexts (from $KUBECONFIG)", str(kp),
+                                        f".kube/{kp.name}", "prefer a scoped kubeconfig secret; the agent's KUBECONFIG"
+                                        " must list this file too"))
     for cid, kind, rel in AGENT_LOGINS:
         p = home / rel
         if p.exists():
@@ -735,5 +902,5 @@ def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = No
             p = Path(repo.path) / f
             found.append(Credential(file_credential_id(p), "secret-looking file in a repo (not committed)",
                                     str(p), None, "use a project secret, or copy it if the repo needs it"))
-    names = sorted(k for k in (env or os.environ) if FLAGGED_ENV_NAME_RE.search(k))
+    names = sorted(k for k in env if FLAGGED_ENV_NAME_RE.search(k))
     return found, names
