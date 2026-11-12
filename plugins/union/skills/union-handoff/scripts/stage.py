@@ -552,7 +552,7 @@ def _ssh_https_block(hosts: list[str]) -> list[str]:
     """Reach SSH remotes over HTTPS, for an agent that has no SSH key."""
     lines = ["# These repos' remotes use SSH and no SSH key was copied, so reach them over",
              "# HTTPS instead, signed in with the GitHub CLI."]
-    if "github.com" in hosts:
+    if hosts.count("github.com"):
         lines += [
             "need gh 'apt_install gh'",
             "gh config set git_protocol https 2>/dev/null || true",
@@ -673,7 +673,7 @@ class StageOptions:
     ship_repos: set[str] = field(default_factory=set)  # bundle the whole history instead of re-cloning
     exclude_repos: set[str] = field(default_factory=set)
     include_dirs: set[str] = field(default_factory=set)
-    allow_transcript_secrets: bool = False
+    allow_flagged_transcripts: bool = False
     all_branches: bool = False  # ship every local branch's unpushed commits, not only HEAD's and worktrees'
     memory: str = "2Gi"
     cpu: str = "2"
@@ -693,7 +693,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     # be copied, unless the user has seen the report and said yes.
     found = {s.key: transcript_secrets(s) for s in sessions}
     found = {k: v for k, v in found.items() if v}
-    if found and not opts.allow_transcript_secrets:
+    if found and not opts.allow_flagged_transcripts:
         lines = [f"  {k}: " + ", ".join(f"{n} {kind}" for kind, n in v.items()) for k, v in found.items()]
         raise SystemExit(
             "These transcripts contain values that look like credentials, and a transcript is copied whole:\n"
@@ -725,7 +725,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
             kinds = inv.scan_secret_values(patches.decode(errors="replace").splitlines())
             if kinds:
                 found[f"uncommitted changes in {top}"] = kinds
-    if found and not opts.allow_transcript_secrets:
+    if found and not opts.allow_flagged_transcripts:
         lines = [f"  {k}: " + ", ".join(f"{n} {kind}" for kind, n in v.items()) for k, v in found.items()]
         raise SystemExit(
             "Uncommitted changes contain values that look like credentials, and they are copied as they are:\n"
@@ -943,7 +943,7 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
              "extra": [str(e) for e in st.source.extra]}
             for st in staged
         ],
-        "allow_transcript_secrets": opts.allow_transcript_secrets,
+        "allow_flagged_transcripts": opts.allow_flagged_transcripts,
         "relocated": relocated,
         "credentials_copied": copied_creds,
         "transcript_secrets": found,
@@ -1034,7 +1034,7 @@ def refresh_transcripts(home: Path, log: Callable[[str], None] = print) -> list[
             extra.append(sidecar)
         s = hz.Session(entry["harness"], entry["id"], src, None, extra=extra)
         todo.append((entry, s))
-    if not manifest.get("allow_transcript_secrets"):
+    if not manifest.get("allow_flagged_transcripts"):
         found = {s.key: transcript_secrets(s) for _, s in todo}
         found = {k: v for k, v in found.items() if v}
         if found:

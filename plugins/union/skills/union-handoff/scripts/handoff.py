@@ -311,7 +311,7 @@ def cmd_stage(args) -> int:
         cpu=args.cpu,
         exclude_repos={str(Path(p).expanduser().resolve()) for p in args.exclude or []},
         include_dirs={str(Path(p).expanduser().resolve()) for p in args.include or []},
-        allow_transcript_secrets=args.allow_transcript_secrets,
+        allow_flagged_transcripts=args.allow_flagged_transcripts,
         all_branches=args.all_branches,
         log=lambda m: print(m, file=sys.stderr),
     )
@@ -399,7 +399,7 @@ try:
     have = {s.name for s in r.Secret.listall(limit=1000)}
 except Exception:
     have = None  # cannot list: let the launcher decide
-if a["check_secret"] and have is not None and not have & set(wanted):
+if a["check_login"] and have is not None and not have & set(wanted):
     link = None
     try:
         ep = r.App.get(name="claude-mint-secret", project=a["project"], domain=a["domain"]).endpoint
@@ -455,11 +455,11 @@ def flyte_python(flyte_cli: str) -> str:
 def launch_command(args) -> list[str]:
     payload = {"task": args.launcher_task, "project": args.project, "domain": args.domain,
                "identifier": args.identifier, "locator": args.locator, "config": args.config,
-               "wait": args.wait, "check_secret": not args.skip_secret_check}
+               "wait": args.wait, "check_login": not args.skip_login_check}
     return [args.python or flyte_python(args.flyte), "-c", LAUNCH_SNIPPET, json.dumps(payload)]
 
 
-def missing_secret_help(args, result: dict, started: bool = False) -> str:
+def missing_login_help(args, result: dict, started: bool = False) -> str:
     """What to do when the agent has no Claude login to run on."""
     project, domain = result.get("project") or args.project, result.get("domain") or args.domain
     lines = [
@@ -531,7 +531,7 @@ def cmd_launch(args) -> int:
     print(json.dumps(result))
     where = f"{result.get('project') or args.project}/{result.get('domain') or args.domain}"
     if result["verdict"] == "missing_secret":
-        print(missing_secret_help(args, result), file=sys.stderr)
+        print(missing_login_help(args, result), file=sys.stderr)
         return 1
     if result["verdict"] == "no_project":
         print("No project and domain to launch in: pass --staged (to use the volume's), or --project and --domain.",
@@ -548,7 +548,7 @@ def cmd_launch(args) -> int:
             wanted = re.search(r"Secret '([^']+)' is missing", error).group(1)
             print(f"Union refused to start {args.identifier!r}: the secret {wanted!r} is missing in {where}.",
                   file=sys.stderr)
-            print(missing_secret_help(args, {**result, "wanted": [wanted], "mint_link": link}, started=True),
+            print(missing_login_help(args, {**result, "wanted": [wanted], "mint_link": link}, started=True),
                   file=sys.stderr)
             return 1
         print(f"Union refused to start {args.identifier!r}: {error}", file=sys.stderr)
@@ -604,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cpu", default="2", help="CPUs for each restored session (default: 2)")
     p.add_argument("--exclude", action="append", help="leave this repo behind")
     p.add_argument("--include", action="append", help="also move this repo or directory")
-    p.add_argument("--allow-transcript-secrets", action="store_true",
+    p.add_argument("--allow-transcript-secrets", action="store_true", dest="allow_flagged_transcripts",
                    help="stage even though a transcript holds credential-looking values")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_stage)
@@ -637,7 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flyte", default="flyte", help="the flyte CLI whose Python to use")
     p.add_argument("--python", help="a Python with flyte-sdk installed (default: the flyte CLI's)")
     p.add_argument("--wait", type=int, default=180, help="seconds to wait for Union to admit or refuse it (default: 180)")
-    p.add_argument("--skip-secret-check", action="store_true",
+    p.add_argument("--skip-secret-check", action="store_true", dest="skip_login_check",
                    help="launch even if no Claude login secret is found for the agent")
     p.add_argument("--dry-run", action="store_true", help="say what would be launched, launch nothing")
     p.set_defaults(func=cmd_launch)

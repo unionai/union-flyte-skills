@@ -4,6 +4,7 @@ the fake machine in evals/fixtures/handoff_world.py."""
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -483,7 +484,7 @@ def test_secrets_in_a_transcript_stop_staging(machine, tmp_path):
     rep = __import__("handoff").build_report([s], None)
     assert rep["sessions"][0]["flagged_in_transcript"] == {"GitHub token": 1}
     assert token not in json.dumps(rep)
-    stg.stage([s], stg.StageOptions(out=tmp_path / "o2", remote_harness="claude", allow_transcript_secrets=True, log=lambda x: None))
+    stg.stage([s], stg.StageOptions(out=tmp_path / "o2", remote_harness="claude", allow_flagged_transcripts=True, log=lambda x: None))
 
 
 def test_remote_url_credentials_are_redacted(machine, tmp_path):
@@ -1015,7 +1016,7 @@ def test_launch_uses_the_python_api(machine, tmp_path):
     payload = json.loads(Path(str(py) + ".payload").read_text())
     assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": None,
                        "domain": None, "identifier": "my-agent",
-                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_secret": True}
+                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_login": True}
 
 
 def test_launch_snippet_is_valid_python():
@@ -1288,7 +1289,7 @@ def test_launch_checks_for_a_login_secret_first(machine, tmp_path):
     assert proc.returncode == 1
     assert "Nothing was started" in proc.stderr and "a-claude-token, a-claude-session" in proc.stderr
     assert "claude setup-token" in proc.stderr and "--project p --domain d" in proc.stderr
-    assert "https://mint.example/" in proc.stderr
+    assert re.search(r"https://mint\.example/", proc.stderr)
 
 
 def test_launch_runs_where_the_volume_was_sealed(machine, tmp_path):
@@ -1324,7 +1325,7 @@ def test_launch_rewrites_the_launchers_missing_secret_refusal(machine, tmp_path)
     assert proc.returncode == 1
     assert "mint_pod_secret" not in proc.stderr.split("}")[-1] and "claude_task" not in proc.stderr.split("}")[-1]
     assert "'a-claude-session' is missing in me/development" in proc.stderr
-    assert "--project me --domain development" in proc.stderr and "https://mint.example/" in proc.stderr
+    assert "--project me --domain development" in proc.stderr and re.search(r"https://mint\.example/", proc.stderr)
 
 
 def test_launch_explains_a_project_without_the_launcher(machine, tmp_path):
