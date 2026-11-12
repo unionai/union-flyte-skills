@@ -1225,7 +1225,8 @@ def test_seal_passes_config_and_aws_profile(machine, tmp_path, monkeypatch):
     assert Path(str(flyte) + ".env").read_text() == "sso-writer 1"
 
 
-def test_probes_and_missing_tools_are_not_tools(tmp_path):
+def test_probes_and_missing_tools_are_not_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv.shutil, "which", lambda name: None)  # none installed here, whatever the host has
     cmds = ["which sky", "command -v sky && sky status", "command -v kubectl", "pipx list | grep sky",
             "terraform --version", "terraform plan", "helm version"]
     names = {t.name for t in inv.tools_from(cmds, tmp_path, not_found={"pipx"})}
