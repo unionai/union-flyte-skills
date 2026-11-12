@@ -162,6 +162,14 @@ def check_cli(exe: Path, names: list[str]) -> None:
             left = [n for n in names if (home / rel / n).exists()]
             check(not left, f"uninstall --target {target} removes them: left {left}")
 
+        mine = home / ".claude/skills" / names[0]
+        mine.mkdir(parents=True)
+        (mine / "SKILL.md").write_text("my own version\n")
+        run([str(exe), "install", "--target", "claude"], env=env)
+        run([str(exe), "uninstall", "--target", "claude"], env=env)
+        check((mine / "SKILL.md").read_text() == "my own version\n",
+              "uninstall keeps a same-named skill the installer skipped")
+
         bad = run([str(exe), "install", "--target", "nope"], env=env, check=False)
         check(bad.returncode != 0, "an unknown target is rejected")
 

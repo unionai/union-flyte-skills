@@ -14,9 +14,20 @@ This repo holds the skills that need Union itself.
 
 | Skill | What it does |
 |---|---|
+| [`union-handoff`](plugins/union/skills/union-handoff/SKILL.md) | Moves sessions from your local coding agent (Claude Code, Codex, pi, opencode, Hermes) into a Union agent: repos, uncommitted work, transcripts, memory and skills, sealed into a Union Volume the agent starts from. Reports sizes, tools and credentials before copying anything. |
 | [`union-docs`](plugins/union/skills/union-docs/SKILL.md) | Finds the right Union docs page before answering, instead of guessing flags. |
 
 ## Install
+
+### With `npx skills` (any harness)
+
+```bash
+npx skills add unionai/union-flyte-skills
+```
+
+[`skills`](https://github.com/vercel-labs/skills) reads the skills straight
+from this repo and installs them for the agents it finds (`-a claude-code`,
+`-g` for user level, `--help` for the rest). Nothing needs publishing for this.
 
 ### As a plugin (Claude Code, Codex)
 
@@ -29,9 +40,13 @@ This repo holds the skills that need Union itself.
 For Codex, add this repository as a plugin marketplace; it reads
 `.agents/plugins/marketplace.json`.
 
-### With the installer, into any harness
+### With the Python installer
 
-The installer is not on PyPI yet. Run it from a checkout:
+```bash
+uvx union-flyte-skills install
+```
+
+Until the first release is on PyPI, run it from a checkout:
 
 ```bash
 git clone https://github.com/unionai/union-flyte-skills

@@ -1,0 +1,41 @@
+id: union-handoff-report
+skill: union-handoff
+tier: script
+# The report step, on a fake machine with a session in every harness, two
+# repos (one with staged, unstaged, untracked and unpushed work and a .env),
+# and credentials that each hold a fake secret.
+fixture: handoff_world
+script: scripts/handoff.py
+args: [report, --json, --session, "{claude}", --session, "{codex}", --session, "{pi}",
+       --session, "{opencode}", --session, "{hermes}"]
+checks:
+  - kind: exit_code
+  - {kind: not_regex, name: no secret value printed, pattern: "{canary}"}
+  # Repos, including one reached only through an edit outside the cwd.
+  - {kind: json_contains, path: "repos[*].path", item: "{webapp}"}
+  - {kind: json_contains, path: "repos[*].path", item: "{infra}"}
+  - {kind: json_contains, path: "repos[*].branch", item: feature/login}
+  - {kind: json_contains, path: "repos[*].unpushed_commits", item: 1}
+  - {kind: json_contains, path: "repos[*].modified_files", item: 2}
+  - {kind: json_contains, path: "repos[*].secret_files", item: [".env"]}
+  # Tools counted from every harness's shell calls; heredoc bodies are data.
+  - {kind: json_contains, path: "tools[*].name", item: gh}
+  - {kind: json_contains, path: "tools[*].name", item: terraform}
+  - {kind: json_contains, path: "tools[*].name", item: npx}
+  - {kind: json_contains, path: "tools[*].name", item: openssl}
+  - {kind: json_contains, path: "tools[*].name", item: mkdocs}
+  - {kind: not_regex, name: heredoc body not counted, pattern: notacommand}
+  # Credentials by id, the agent login never copyable, env vars by name only.
+  - {kind: json_contains, path: "credentials[*].id", item: gh}
+  - {kind: json_contains, path: "credentials[*].id", item: aws}
+  - {kind: json_contains, path: "credentials[*].id", item: "file:{webapp}/.env"}
+  - {kind: json_contains, path: "credentials[*].id", item: claude-login}
+  - {kind: json_contains, path: "flagged_env_names", item: MY_SERVICE_API_KEY}
+  # How each session would arrive with the default remote harness.
+  - {kind: json_equals, path: "sessions[0].arrives", equals: resumable}
+  - {kind: json_equals, path: "sessions[1].arrives", equals: resumable}
+  - {kind: json_equals, path: "sessions[2].arrives", equals: handoff note}
+  - {kind: json_equals, path: "sessions[2].remote_harness", equals: claude}
+  - {kind: json_min, path: "totals.total_bytes_estimate", min: 1}
+  # Every session is scanned for credential-looking values; the fixture has none.
+  - {kind: json_equals, path: "sessions[0].flagged_in_transcript", equals: {}}

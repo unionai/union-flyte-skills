@@ -1,0 +1,312 @@
+---
+name: union-handoff
+description: Move work from this machine's coding agent (Claude Code, Codex, pi, opencode, Hermes) into a Union agent. Finds recent sessions with their repos, branches, uncommitted changes, memory and skills; reports sizes, tools used and credentials found before copying anything; packages the chosen sessions into a sealed Union Volume as the agent's home, where they are listed as finished sessions that resume on Restart. Use when the user wants to hand off, move, continue or offload a local session to Union, or run it remotely.
+---
+
+# Hand off local sessions to a Union agent
+
+You move one or more of this machine's coding-agent sessions, and everything
+they were working on, into a **Union agent**: a hosted coding agent whose home
+directory is a Union Volume. The sessions arrive as finished sessions in that
+agent, and the user resumes each one from there.
+
+The work is done by `scripts/handoff.py` (Python 3.9+, standard library only).
+Run it with the skill directory as the base, for example
+`python3 <skill-dir>/scripts/handoff.py discover`.
+
+Follow the steps in order. **Copy nothing before step 3's report has been
+shown and the user has answered steps 4 and 5.**
+
+**Ask every question with your harness's question tool**, not as a list in
+your reply: in Claude Code that is `AskUserQuestion`; use the equivalent
+in other harnesses that have one. Give it the
+choices as options, with the recommended one first and a one-line
+description each, and use multi-select where several can apply (which
+sessions to move, which credentials to copy). Only when the harness has no
+such tool, ask in plain text, one question at a time, and wait for the answer.
+
+The questions, in order: which sessions (step 2); per repo with unpushed or
+uncommitted work, push first or ship in the volume, and per credential, copy
+or not (step 3); which harness (step 4); memory per session (step 5); and
+the go-ahead before sealing (step 6).
+
+## 1. Discover
+
+```bash
+python3 scripts/handoff.py discover --limit 20
+```
+
+It reads every harness it knows, newest first: session id, last update, size,
+working directory and title. Filter with `--harness claude|codex|pi|opencode|hermes`
+or `--cwd <dir>`. Where each harness keeps its sessions, and how that was
+verified, is in [references/harnesses.md](references/harnesses.md).
+
+The session you are running in right now is usually the newest one for your
+own harness. Point it out.
+
+**Unknown harness.** If yours is not listed or nothing is found, you know
+better than the script where your own sessions and working files live. Find
+the transcript file (or directory) and the working directory, and pass the
+session as `file:<transcript path>@<working directory>` in the steps below.
+Such a session always arrives as a written handoff (step 4).
+
+## 2. Ask which sessions to move
+
+Show the list and ask which to move: one or several. Sessions that share a repo
+share its copy.
+
+## 3. Report, before copying anything
+
+```bash
+python3 scripts/handoff.py report --session claude:<id> [--session ...]
+```
+
+Show the user the whole report, in your own words where it helps. It covers:
+
+- **Repos.** Every git repo the sessions worked in (their working directory,
+  plus any repo their tools edited), with its branch and worktrees. A repo
+  with a remote travels **by reference**: the agent re-clones it from that
+  remote when it first boots, recreates its worktrees, and checks out the same
+  branch. Only what the remote does not have is shipped: commits not pushed
+  yet (as a small bundle), staged and unstaged changes, and untracked files.
+  The report counts the unpushed commits on **the session's branch**
+  separately from those on other local branches. By default only the
+  session's branch and branches checked out in its worktrees travel; the
+  others stay behind unless the user asks for `--all-branches` (on `report`
+  and `stage`). Virtualenvs, `node_modules` and build output are never
+  copied, from repos, skills or memory alike.
+  A repo with no remote travels as a **git bundle** of its whole history plus
+  that uncommitted work. A directory that is not a git repo travels as a
+  **full tree**, without `node_modules`, virtualenvs and build output. Offer
+  `--ship <repo>` to send a repo's whole history instead of re-cloning it,
+  `--tree <repo>` for one the user wants copied as-is, `--exclude <repo>` to
+  leave one behind, and
+  `--include <dir>` for a repo the sessions used that the report missed (the
+  script finds repos from working directories, file tools and `cd`/`git -C` in
+  shell commands, but a script can reach a repo in ways it cannot see). Pass
+  the same flags to `report` again to see the result.
+- **Transcripts** and their sizes, and an estimated **total**.
+
+For each repo with **unpushed commits or uncommitted changes**, ask the user
+which they prefer: push them to the remote now (they, or you with their
+explicit go-ahead, run `git push`; uncommitted work needs committing first),
+or let them travel in the volume. Pushing keeps the volume small and the
+work safe on the remote; shipping keeps it private until they push it.
+A repo that travels by reference needs **read access to its remote from the
+agent**. For github.com (and whenever the sessions used `gh`), the setup
+script signs in with the GitHub CLI before re-cloning: with no login yet, it
+prints a one-time code and a link and waits until the user enters the code
+there. Copying the GitHub CLI login (step below) skips that. A remote that
+uses **SSH** (`git@github.com:...`) needs an SSH key in the agent; when no
+key is copied, the setup script reaches github.com over HTTPS instead
+(`gh auth setup-git` and an `insteadOf` rule).
+- **Tools** the sessions ran, counted from their shell commands, with how each
+  was installed locally (brew, npm, pip/uv, cargo) and the Linux line that
+  installs it in the agent. **Binaries are never copied**: a macOS binary does
+  not run on Linux. A setup script installs Linux builds on first boot.
+  Checking for a tool is not using it: `command -v x`, `x --version`, and a
+  command the shell reported "not found" (when it is not installed here
+  either) are not counted.
+- **Credentials** found: GitHub CLI, git credential files, SSH keys, cloud CLI
+  logins (AWS, Google Cloud, Azure), kubeconfigs, registry and package tokens,
+  secret-looking files such as `.env`, `.npmrc` or `id_ed25519` in a repo, and
+  the names (never the values) of secret-looking environment variables. The
+  report never prints a credential's value. A tool pointed elsewhere by its
+  environment variable (`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`,
+  `KUBECONFIG`, `CLOUDSDK_CONFIG`, `GH_CONFIG_DIR`) is read from where that
+  variable points, and lands at the standard path in the agent. A GitHub CLI
+  login whose token lives in the system keyring (the macOS Keychain) is
+  listed as not copyable: copying its file carries no token, so the user
+  runs `gh auth login` in the agent instead.
+- **Credentials inside what would be copied.** A transcript is copied whole,
+  so a token the user pasted or a session printed travels with it; the report
+  flags each transcript that holds credential-looking values, and the
+  uncommitted changes too. Files that look like secrets and are already
+  **committed** travel in the git history, and so does a secret committed and
+  later deleted, which the report cannot see. Say so plainly; the fix is to
+  rotate the secret, or leave that session or repo out.
+
+For **each** credential, ask whether to copy it. Say plainly:
+
+> Copying a credential into the agent's home means anyone who can open that
+> agent, or mount its volume, can read it. The alternative is to sign in again
+> inside the agent, or to give it a project secret.
+
+The default is not to copy. Pick one with `--credential <id>` at the stage
+step, using the id from the report (a file inside a repo has an id like
+`file:/path/to/repo/.env`). Never offer the Claude or Codex login itself: the
+agent signs in on its own. Environment variables cannot be copied; suggest
+project secrets for them.
+
+`stage` refuses to copy a transcript that holds credential-looking values
+until the user has seen that and said to go ahead (`--allow-transcript-secrets`).
+
+## 4. Ask which harness the agent runs
+
+Union agents run **Claude Code** and **Codex**. Default to the local harness
+(`claude` to `claude`, `codex` to `codex`). Before the user picks, explain what
+each choice means, using the report's `arrives as` column:
+
+- **Same harness:** each session arrives **resumable**, with its full
+  conversation, in a working directory that maps to the old one.
+- **Different harness, or one Union does not run (pi, opencode, Hermes, a
+  `file:` session):** the files all move, but each session arrives as a
+  **written handoff**: its transcript plus a `HANDOFF.md` note that a new
+  session starts from. It cannot be resumed as-is.
+
+Re-run the report with `--remote-harness <choice>` if it changes anything.
+
+## 5. A new agent (merging into an existing one is not supported yet)
+
+The handoff goes into a fresh volume, and a new agent starts with it as its
+home (step 7). **Merging into an existing agent's home is not supported in
+the Union console yet**: the console can only give a home volume to a new
+agent. If the user asks for a merge, say so, and offer a new agent instead.
+
+Also ask how much **memory** each restored session should get (default
+`2Gi`; pass `--memory`, and `--cpu` for CPUs, default 2). It is recorded with
+each session and used when it is restarted.
+
+## 6. Stage, review, seal
+
+Stage into a new local directory first, so the user can look before anything
+leaves the machine:
+
+```bash
+python3 scripts/handoff.py stage --out ~/union-handoff/<name> \
+  --remote-harness claude --session claude:<id> [--session ...] \
+  [--credential <id> ...] [--ship <repo>] [--tree <repo>] [--exclude <repo>] \
+  [--memory 2Gi] [--cpu 2]
+```
+
+`stage` prints the staged size, and warns, listing the largest directories,
+when it is far above the report's estimate: look for something that should
+not travel before sealing.
+
+A Union Volume reserves a few names at its root (`.config`, `.stats`,
+`.accesslog`, `.trash`), so `~/.config` (where `gh` and `gcloud` keep their
+logins) is staged as `~/.handoff/xdg-config/`, and the setup script copies it
+into `$XDG_CONFIG_HOME` or `~/.config` in the agent. `seal` refuses a staged
+home that still has a reserved name at its top level.
+
+Then, before sealing:
+
+1. **Write the summaries.** For each session that arrives as a written
+   handoff, open `home/handoff/<session>/HANDOFF.md` and replace the comment
+   under "Summary" with a short summary of that session from its transcript:
+   the goal, what is done, what is in progress, and the next step.
+2. **Review the setup script** at `home/.handoff/setup.sh`. Fill in or delete
+   its `TODO` lines; you know these tools better than the script does. It
+   exits non-zero, and does not mark itself done, until every tool it lists
+   is installed.
+3. Tell the user what was staged and where (`home/.handoff/README.md` lists
+   it), and ask them to confirm.
+
+Seal it into a Union Volume with the `flyte` CLI from `flyteplugins-union`
+(`pip install flyteplugins-union`; check `flyte create volume --help`). The
+user needs a Union login (`flyte` config for their org, project and domain).
+
+**The upload uses the user's own cloud credentials**, not Union's: the files
+go straight from this machine to the project's bucket, so the credentials
+need write access to it. If the default AWS profile cannot write there, ask
+which profile can, and pass it with `--aws-profile` (sign in to it first,
+e.g. `aws sso login --profile <name>`). Pass `--config <file>` for a flyte
+config other than the default.
+
+```bash
+# New agent
+python3 scripts/handoff.py seal --staged ~/union-handoff/<name> \
+  --volume <name> --artifact <name> --project <project> --domain <domain> \
+  [--config <flyte config>] [--aws-profile <profile>]
+
+```
+
+Add `--dry-run` first to show the exact `flyte` command. `seal` copies the
+transcripts again from their sources first, so a session that kept going
+since `stage` (this one, usually) arrives with its whole conversation
+(`--no-refresh` skips that; `stage --refresh --out <dir>` does it on its
+own). Then it mounts the volume, copies the staged home in, and stops the
+mount, which seals a new, immutable version and prints its locator. Files go
+in without extended attributes, so macOS writes no `._*` files into the
+volume. Pass `--bucket s3://...` to pick the storage instead of the
+project's default.
+
+Stopping a mount in any normal way (Ctrl-C, `kill`, `flyte unmount volume`)
+publishes what is in it. So if the copy fails or is interrupted part way,
+`seal` leaves the mount up and unpublished, and prints how to finish the copy
+and publish, or discard it. Relay that to the user as it is; do not stop the
+mount yourself.
+
+## 7. Start the agent
+
+`seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`)
+and recorded it, with the project and domain it sealed into, in
+`<staged>/sealed.json`. Start an agent with it as its home; do not start any
+session, they wait in the home, finished.
+
+```bash
+python3 scripts/handoff.py launch --staged <staged> --identifier <agent-name>
+```
+
+This starts Union's agent launcher, the deployed task
+`agent-workspace-launcher.launch_agent_workspace`, with `identifier` and
+`home_locator`, through the flyte Python SDK (it uses the Python that the
+user's `flyte` CLI runs on; `--python` overrides). It runs in the volume's
+project and domain (the flyte config's defaults when `seal` was given none);
+`--project` and `--domain` pick another, `--locator` takes a locator directly
+instead of `--staged`, `--launcher-task` names a launcher deployed under
+another name, and `--config` picks a flyte config other than the default.
+That project and domain need both the launcher and the agent's Claude login
+(below); if the launcher is not deployed there, `launch` says so and starts
+nothing. Add `--dry-run` to see what would be launched. Use a new name for
+`--identifier`: that creates the agent. It prints the agent's run, which
+stays running while the agent is on.
+
+The agent's lead opens with a first message asking it to run the setup
+script and to pass on any GitHub sign-in code it prints, so tell the user to
+watch the agent's chat for that code. `--prompt` replaces the message and
+`--no-prompt` sends none; if the launcher takes no first message, `launch`
+says so, and the user asks the agent to run `bash ~/.handoff/setup.sh`.
+
+**The agent runs on a Claude login stored as a secret** in the project and
+domain the agent runs in (above). It uses the first of
+these that exists: `<identifier>-claude-token`, `<identifier>-claude-session`,
+then `<user>-claude-token` and `<user>-claude-session`, where `<user>` is the
+launching user's name (their email address before the `@`). `launch` checks
+for them before starting anything, and when none exists it stops and says
+how to create one:
+
+- a long-lived token (recommended, since several agents can share it): run
+  `claude setup-token`, then
+  `flyte create secret <identifier>-claude-token --project <project> --domain <domain>`
+  and paste the token at the prompt;
+- or, where the organization runs Union's sign-in app, the link `launch`
+  prints, which is that app pre-filled with the secret's name, project and
+  domain: signing in with Claude there stores the session secret.
+
+A session secret can serve only one agent that is on at a time: Union refuses
+a second ("already in use ... turn that one off first"), and nothing is
+disturbed when that happens. Give the agent its own token, then launch again
+with the same identifier.
+
+In the Union console the same is **New agent**, with the locator in the
+optional **Home volume** field.
+
+Then tell the user where to find each session:
+
+- **Resumable sessions** are listed under the agent's finished sessions, by
+  the names in `home/.handoff/README.md`. **Restart** resumes one where it
+  left off, in its repo under `src/`.
+- **Written handoffs** are in `~/handoff/<session>/` inside the agent. Start a
+  new session and ask it to read `~/handoff/<session>/HANDOFF.md` first.
+- On first boot the lead runs `bash ~/.handoff/setup.sh` (its first message,
+  above), **before any session is restarted**; the home's `CLAUDE.md` or
+  `AGENTS.md` says the same. It signs in to GitHub where needed, re-clones the
+  repos that travelled by reference and reapplies their local work, then
+  installs the tools. Running it again is harmless. A clone that still fails
+  usually means the agent cannot reach a git host other than GitHub: sign in
+  there and run it again.
+- Credentials that were not copied need a fresh sign-in inside the agent.
+
+What lands where in the agent's home, and why, is in
+[references/layout.md](references/layout.md).
