@@ -24,7 +24,16 @@ handoff/<session>/                  a session that cannot resume: transcript + H
 .handoff/instructions/              instructions from harnesses the agent does not run
 CLAUDE.md or AGENTS.md              a short note pointing at .handoff/ (appended)
 <credential paths>                  only the credentials you picked, mode 0600
+.handoff/xdg-config/                what belongs in ~/.config (a picked gh or gcloud login)
 ```
+
+A Union Volume reserves a few names at its root (`.config`, `.stats`,
+`.accesslog`, `.trash`, `.control`): they are read-only virtual entries, so
+nothing can be written under them. Anything staged under one moves aside,
+`~/.config` to `.handoff/xdg-config/` and the others to
+`.handoff/reserved/<name>/`, and the setup script copies `xdg-config` into
+`$XDG_CONFIG_HOME`, or `~/.config` where that is a directory, or else
+`~/.xdg-config` (exporting `XDG_CONFIG_HOME` in `~/.bashrc`).
 
 ## Repos
 
@@ -35,9 +44,12 @@ kept), every local branch with its commit and upstream, the checked-out
 branch or commit, and which repo it is a worktree of. What the remote has is
 asked of the remote itself (`git ls-remote`), not read from tracking refs
 that may be stale. Shipped beside it is only what the remote lacks: one
-bundle of every local branch, tag and HEAD commit not reachable from the
-remote's current tips, the staged and unstaged diffs, and the untracked
-files. If the remote cannot be reached, or shares no commits with the repo,
+bundle of the commits of HEAD and of the branches checked out in the repo's
+worktrees not reachable from the remote's current tips, the staged and
+unstaged diffs, and the untracked files (without virtualenvs, `node_modules`
+or build output). With `--all-branches` the bundle also carries every other
+local branch and tag; without it, a branch whose commits stay behind is left
+out of `repo.json` too, since the agent could not recreate it. If the remote cannot be reached, or shares no commits with the repo,
 the repo is shipped whole instead.
 
 On first boot `restore_repos.py` clones each main checkout (keeping the
@@ -98,5 +110,9 @@ One `need <binary> <install line>` per tool the sessions ran that the agent
 image may lack. A tool already present is skipped, so running it twice is
 harmless. Lines the script could not work out are left as `TODO` comments.
 It first takes ownership of the copied repos (files sealed on another machine
-keep its user id, and git refuses a repo owned by someone else), and it only
-writes `~/.handoff/setup.done` once every tool it lists is on the PATH.
+keep its user id, and git refuses a repo owned by someone else), puts back
+`~/.config` (above), and, when a repo's remote uses SSH and no SSH key was
+copied, switches github.com to HTTPS (`gh config set git_protocol https`,
+`gh auth setup-git`, and an `insteadOf` rule for `git@github.com:`) before
+re-cloning the repos. It only writes `~/.handoff/setup.done` once every tool
+it lists is on the PATH.

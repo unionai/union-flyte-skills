@@ -29,7 +29,9 @@ import stage as stg  # noqa: E402
 def machine(tmp_path, monkeypatch):
     v = world.build(tmp_path)
     monkeypatch.setenv("HOME", str(v["home"]))
-    for k in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "HERMES_HOME", "OPENCODE_DB", "XDG_DATA_HOME", "KUBECONFIG"):
+    for k in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "PI_CODING_AGENT_DIR", "HERMES_HOME", "OPENCODE_DB", "XDG_DATA_HOME", "KUBECONFIG",
+              "XDG_CONFIG_HOME", "GH_CONFIG_DIR", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "CLOUDSDK_CONFIG",
+              "AWS_PROFILE"):
         monkeypatch.delenv(k, raising=False)
     for k, val in world.ENV.items():
         monkeypatch.setenv(k, val)
@@ -183,7 +185,7 @@ def test_claude_slug():
 # Stage
 
 
-def stage_all(machine, tmp_path, remote, *, creds=(), ship=True):
+def stage_all(machine, tmp_path, remote, *, creds=(), ship=True, all_branches=False):
     """Stage every fixture session. ``ship`` sends whole repos (the bundle
     path); ship=False lets repos with a remote travel by reference."""
     pool = hz.discover()
@@ -191,7 +193,7 @@ def stage_all(machine, tmp_path, remote, *, creds=(), ship=True):
     out = tmp_path / "out"
     repos = {str(machine["webapp"]), str(machine["infra"])} if ship else set()
     manifest = stg.stage(sessions, stg.StageOptions(out=out, remote_harness=remote, credentials=set(creds),
-                                                    ship_repos=repos, log=lambda m: None))
+                                                    ship_repos=repos, all_branches=all_branches, log=lambda m: None))
     return out / "home", manifest
 
 
@@ -251,8 +253,9 @@ def test_stage_for_claude(machine, tmp_path):
 def test_stage_copies_only_picked_credentials(machine, tmp_path):
     env_id = f"file:{machine['webapp']}/.env"
     home, manifest = stage_all(machine, tmp_path, "claude", creds=["gh", env_id])
-    gh = home / ".config/gh/hosts.yml"
+    gh = home / ".handoff/xdg-config/gh/hosts.yml"  # a Union Volume reserves .config at its root
     assert gh.exists() and oct(gh.stat().st_mode & 0o777) == "0o600"
+    assert not (home / ".config").exists()
     assert (home / "src/webapp/.env").exists()
     assert not (home / ".aws").exists()
     assert set(manifest["credentials_copied"]) == {"gh", env_id}
@@ -893,9 +896,18 @@ def test_other_branches_and_tags_with_unpushed_work_survive(machine, tmp_path, m
     exp = _commit(infra, "exp.txt", "exp", "experiment")
     subprocess.run(["git", "-C", str(infra), "tag", "v-local"], check=True)
     subprocess.run(["git", "-C", str(infra), "checkout", "-q", "main"], check=True)
+    # By default only the session's branch (and worktrees') travel: the other
+    # branch is reported separately and left behind.
     rep = __import__("handoff").build_report([hz.find(machine["codex"])], None)
+    r = {r["path"]: r for r in rep["repos"]}[str(infra)]
+    assert (r["unpushed_commits"], r["head_unpushed"], r["other_branches_unpushed"]) == (0, 0, {"experiment": 1})
+    default, _ = stage_all(machine, tmp_path / "default", "claude", ship=False)
+    assert not (default / ".handoff/repos/infra/unpushed.bundle").exists()
+    assert "experiment" not in json.loads((default / ".handoff/repos/infra/repo.json").read_text())["branches"]
+
+    rep = __import__("handoff").build_report([hz.find(machine["codex"])], None, all_branches=True)
     assert {r["path"]: r for r in rep["repos"]}[str(infra)]["unpushed_commits"] == 1
-    home, m = stage_all(machine, tmp_path, "claude", ship=False)
+    home, m = stage_all(machine, tmp_path, "claude", ship=False, all_branches=True)
     assert (home / ".handoff/repos/infra/unpushed.bundle").is_file()
     agent = tmp_path / "agent"
     shutil.copytree(home, agent, symlinks=True)
@@ -980,3 +992,334 @@ def test_merge_collision_covers_reference_repos(machine, tmp_path):
     dest = tmp_path / "existing-home"
     (dest / "src/webapp").mkdir(parents=True)
     assert "src/webapp" in sl.collisions(home, dest)
+
+
+def _fake_python(tmp_path: Path, body: str) -> Path:
+    """Stands in for the flyte CLI's Python: records the launch payload."""
+    py = tmp_path / "python"
+    py.write_text("#!/bin/sh\n" + body)
+    py.chmod(0o755)
+    return py
+
+
+def test_launch_uses_the_python_api(machine, tmp_path):
+    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\n'
+                      'echo \'{"run": "r123", "url": "https://x/r123", "verdict": "on", "error": ""}\'\n')
+    args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent", "--python", str(py)]
+    dry = run_cli(machine, *args, "--dry-run")
+    assert dry.returncode == 0 and "agent-workspace-launcher.launch_agent_workspace in system/production" in dry.stdout
+    assert not Path(str(py) + ".payload").exists()
+    real = run_cli(machine, *args)
+    assert real.returncode == 0, real.stderr
+    assert json.loads(real.stdout.strip().splitlines()[-1])["run"] == "r123"
+    payload = json.loads(Path(str(py) + ".payload").read_text())
+    assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": "system",
+                       "domain": "production", "identifier": "my-agent",
+                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_secret": True}
+
+
+def test_launch_snippet_is_valid_python():
+    import ast
+    ast.parse(__import__("handoff").LAUNCH_SNIPPET)
+
+
+def test_launch_finds_the_flyte_clis_python(tmp_path, monkeypatch):
+    cli = tmp_path / "flyte"
+    cli.write_text("#!/opt/somewhere/bin/python3.12\nprint('x')\n")
+    cli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    assert __import__("handoff").flyte_python("flyte") == "/opt/somewhere/bin/python3.12"
+
+
+def test_launch_explains_an_agent_that_is_on(machine, tmp_path):
+    py = _fake_python(tmp_path, "echo 'AgentAlreadyOn: my-agent is on' >&2\nexit 1\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "my-agent", "--python", str(py))
+    assert proc.returncode == 1 and "Turn it off first" in proc.stderr
+
+
+def test_launch_reports_a_refusal(machine, tmp_path):
+    msg = "Secret 'me-claude-session' is already in use by agent 'me'. turn that one off first"
+    py = _fake_python(tmp_path, "echo '" + json.dumps({"run": "r1", "url": "u", "verdict": "refused", "error": msg}) + "'\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "a", "--python", str(py))
+    assert proc.returncode == 1
+    assert "Union refused to start 'a'" in proc.stderr and "login of its own" in proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Findings from a real macOS handoff
+
+
+def test_virtualenvs_in_skills_memory_and_untracked_files_stay_behind(machine, tmp_path):
+    skill = Path(machine["home"]) / ".claude/skills/my-skill"
+    (skill / ".venv/lib").mkdir(parents=True)
+    (skill / ".venv/lib/_native.cpython-312-darwin.so").write_bytes(b"\0" * 1000)
+    (skill / ".venv/bin").mkdir()
+    (skill / ".venv/bin/python").symlink_to("/usr/bin/python3")  # points outside: not a login file either
+    (skill / "node_modules/x").mkdir(parents=True)
+    (skill / "node_modules/x/index.js").write_text("x")
+    (skill / "._SKILL.md").write_text("appledouble")
+    mem = Path(machine["home"]) / ".claude/projects" / hz.claude_slug(str(machine["webapp"])) / "memory"
+    (mem / "__pycache__").mkdir()
+    (mem / "__pycache__/m.pyc").write_bytes(b"x")
+    (Path(machine["webapp"]) / ".venv/lib").mkdir(parents=True)  # untracked and not ignored
+    (Path(machine["webapp"]) / ".venv/lib/big.dylib").write_bytes(b"\0" * 1000)
+    home, manifest = stage_all(machine, tmp_path, "claude", ship=False)
+    staged = home / ".claude/skills/my-skill"
+    assert (staged / "SKILL.md").exists()
+    assert not (staged / ".venv").exists() and not (staged / "node_modules").exists()
+    assert not (staged / "._SKILL.md").exists()
+    assert not (home / ".claude/projects/-root-src-webapp/memory/__pycache__").exists()
+    assert not (home / ".handoff/repos/webapp/untracked/.venv").exists()
+    assert (home / ".handoff/repos/webapp/untracked/notes.txt").exists()
+    assert not any(str(skill / ".venv") in p for p in manifest["extras"]["left_behind"])
+
+
+def test_stage_warns_when_far_above_the_estimate(machine, tmp_path):
+    skill = Path(machine["home"]) / ".claude/skills/my-skill"
+    (skill / "data.bin").write_bytes(b"\0" * (30 * 1024 * 1024))
+    pool = hz.discover()
+    logs = []
+    manifest = stg.stage([hz.find(machine["claude"], pool)], stg.StageOptions(
+        out=tmp_path / "out", remote_harness="claude", log=logs.append))
+    assert manifest["bytes"] > 30 * 1024 * 1024 > manifest["estimate_bytes"]
+    text = "\n".join(logs)
+    assert "far above" in text and ".claude/skills/my-skill" in text
+
+
+def test_dot_config_is_relocated_and_setup_puts_it_back(machine, tmp_path):
+    home, manifest = stage_all(machine, tmp_path, "claude", creds=["gh"])
+    assert not (home / ".config").exists()
+    assert manifest["relocated"] == {".config": ".handoff/xdg-config"}
+    assert stg.reserved_in(home) == []
+    setup = (home / ".handoff/setup.sh").read_text()
+    assert "xdg-config" in setup
+    # Run only the relocation block, as on an agent whose ~/.config is a file
+    # (a Union Volume's root) and as on one where it is a directory.
+    block = stg.SETUP_HEADER.split("if have apt-get &&")[0].replace("set -u", "set -u") + stg.XDG_CONFIG_BLOCK
+    for case in ("file", "dir"):
+        agent = tmp_path / f"agent-{case}"
+        shutil.copytree(home, agent, symlinks=True)
+        if case == "file":
+            (agent / ".config").write_text("{}")
+        else:  # an existing file there is never overwritten
+            (agent / ".config/gh").mkdir(parents=True)
+            (agent / ".config/gh/config.yml").write_text("theirs\n")
+            (agent / ".handoff/xdg-config/gh/config.yml").write_text("ours\n")
+        script = tmp_path / f"block-{case}.sh"
+        script.write_text(block + '\necho "FAILED=$FAILED"\n')
+        env = {"HOME": str(agent), "PATH": os.environ["PATH"]}
+        proc = subprocess.run(["bash", str(script)], env=env, text=True, capture_output=True)
+        assert proc.returncode == 0 and "FAILED=\n" in proc.stdout, proc.stderr
+        where = agent / (".xdg-config" if case == "file" else ".config")
+        assert (where / "gh/hosts.yml").is_file()
+        if case == "file":
+            assert 'XDG_CONFIG_HOME="$HOME/.xdg-config"' in (agent / ".bashrc").read_text()
+        else:
+            assert (where / "gh/config.yml").read_text() == "theirs\n"
+        assert (agent / ".handoff/xdg-config.done").exists()
+
+
+def test_seal_refuses_reserved_names_before_mounting(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    (home / ".config/gh").mkdir(parents=True)
+    for dry in (True, False):
+        with pytest.raises(SystemExit) as e:
+            sl.seal(sl.SealOptions(staged_home=home, volume="v", dry_run=dry, flyte="/nonexistent/flyte"))
+        assert ".config" in str(e.value) and "reserves" in str(e.value)
+
+
+def test_copy_skips_and_sweeps_appledouble_files(tmp_path, monkeypatch):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    (src / "d").mkdir(parents=True)
+    (src / "d/a.txt").write_text("a")
+    (src / "d/a.txt").chmod(0o640)
+    (src / "._junk").write_text("x")
+    dest.mkdir()
+    real = sl._copy_plain
+
+    def like_macos(f, out):  # the kernel adds ._name beside a file written into the mount
+        real(f, out)
+        (out.parent / f"._{out.name}").write_text("written by macOS")
+
+    monkeypatch.setattr(sl, "_copy_plain", like_macos)
+    result = sl.copy_into(src, dest, merge=False)
+    assert (dest / "d/a.txt").read_text() == "a"
+    assert oct((dest / "d/a.txt").stat().st_mode & 0o777) == "0o640"
+    assert not (dest / "._junk").exists() and not (dest / "d/._a.txt").exists()
+    assert result["appledouble_deleted"] == ["d/._a.txt"]
+
+
+def test_gh_login_kept_in_the_keyring_is_not_offered(machine, tmp_path):
+    hosts = Path(machine["home"]) / ".config/gh/hosts.yml"
+    hosts.write_text("github.com:\n  user: someone\n  git_protocol: ssh\n")
+    creds = {c.id: c for c in inv.credentials(Path(machine["home"]))[0]}
+    assert not creds["gh"].copyable and "copies no token" in creds["gh"].advice
+    with pytest.raises(SystemExit):
+        stage_all(machine, tmp_path, "claude", creds=["gh"])
+    proc = run_cli(machine, "report", "--session", machine["claude"])
+    assert "copies no token" in proc.stdout and "[never copied]" in proc.stdout
+
+
+def _ssh_remote(machine):
+    web = Path(machine["webapp"])
+    subprocess.run(["git", "-C", str(web), "remote", "set-url", "origin", "git@github.com:example/webapp.git"], check=True)
+    gc = Path(machine["home"]) / ".gitconfig"
+    gc.write_text(gc.read_text() + f'[url "{Path(machine["github"]).as_uri()}/"]\n\tinsteadOf = git@github.com:example/\n')
+
+
+def test_ssh_remote_without_a_key_restores_over_https(machine, tmp_path):
+    _ssh_remote(machine)
+    home, manifest = stage_all(machine, tmp_path, "claude", ship=False)
+    assert manifest["repos"][str(machine["webapp"])]["clone_url"] == "git@github.com:example/webapp.git"
+    setup = (home / ".handoff/setup.sh").read_text()
+    assert "gh auth setup-git" in setup and "git config --global --add url.https://github.com/.insteadOf" in setup
+    assert setup.index("gh auth setup-git") < setup.index("restore_repos.py")
+    subprocess.run(["bash", "-n", str(home / ".handoff/setup.sh")], check=True)
+
+
+def test_ssh_remote_with_a_key_copied_keeps_ssh(machine, tmp_path):
+    _ssh_remote(machine)
+    key = Path(machine["home"]) / ".ssh/id_ed25519"
+    key.parent.mkdir()
+    key.write_text("not a real key\n")
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False, creds=["ssh:id_ed25519"])
+    assert "gh auth setup-git" not in (home / ".handoff/setup.sh").read_text()
+
+
+def test_credentials_follow_their_environment_variables(machine, tmp_path, monkeypatch):
+    h = Path(machine["home"])
+    (h / ".aws/config").write_text("[default]\nregion = us-east-1\n")
+    (h / ".aws/config.merged").write_text("[profile a]\n[profile b]\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(h / ".aws/config.merged"))
+    kube = tmp_path / "kube-a.yaml"
+    kube.write_text("apiVersion: v1\n")
+    monkeypatch.setenv("KUBECONFIG", str(kube))
+    creds = {c.id: c for c in inv.credentials(h)[0]}
+    assert creds["aws-config"].path == str(h / ".aws/config.merged") and creds["aws-config"].rel == ".aws/config"
+    assert "AWS_CONFIG_FILE" in creds["aws-config"].kind
+    assert creds["kubeconfig"].path == str(kube) and creds["kubeconfig"].rel == ".kube/config"
+    home, _ = stage_all(machine, tmp_path, "claude", creds=["aws-config", "kubeconfig"])
+    assert (home / ".aws/config").read_text() == "[profile a]\n[profile b]\n"
+    assert (home / ".kube/config").read_text() == "apiVersion: v1\n"
+
+
+FAKE_FLYTE_ENV = FAKE_FLYTE.replace(
+    'open(os.path.join(sys.argv[0] + ".argv"), "w").write(" ".join(argv))',
+    'open(os.path.join(sys.argv[0] + ".argv"), "w").write(" ".join(argv))\n'
+    'open(sys.argv[0] + ".env", "w").write(os.environ.get("AWS_PROFILE", "") + " " + os.environ.get("COPYFILE_DISABLE", ""))')
+
+
+def test_seal_passes_config_and_aws_profile(machine, tmp_path, monkeypatch):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    proc = run_cli(machine, "seal", "--staged", str(home.parent), "--volume", "v", "--config", "/x/config.yaml",
+                   "--aws-profile", "sso-writer", "--dry-run")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["command"].startswith("AWS_PROFILE=sso-writer flyte --config /x/config.yaml create volume v")
+    flyte = tmp_path / "flyte"
+    flyte.write_text(FAKE_FLYTE_ENV)
+    flyte.chmod(0o755)
+    monkeypatch.setattr(sl.os.path, "ismount", lambda p: Path(p, ".mounted").exists())
+    sl.seal(sl.SealOptions(staged_home=home, volume="v", flyte=str(flyte), mountpoint=tmp_path / "mnt",
+                           config="/x/config.yaml", aws_profile="sso-writer", mount_timeout=30, publish_timeout=30))
+    assert Path(str(flyte) + ".argv").read_text().startswith("--config /x/config.yaml create volume v")
+    assert Path(str(flyte) + ".env").read_text() == "sso-writer 1"
+
+
+def test_probes_and_missing_tools_are_not_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv.shutil, "which", lambda name: None)  # none installed here, whatever the host has
+    cmds = ["which sky", "command -v sky && sky status", "command -v kubectl", "pipx list | grep sky",
+            "terraform --version", "terraform plan", "helm version"]
+    names = {t.name for t in inv.tools_from(cmds, tmp_path, not_found={"pipx"})}
+    assert "terraform" in names and "sky" in names  # `sky status` ran
+    assert not {"kubectl", "pipx", "helm", "which"} & names
+    assert inv.not_found_names("zsh: command not found: pipx\nbash: line 1: sky: command not found\n"
+                               "sh: 1: fd: not found") == {"pipx", "sky", "fd"}
+
+
+def test_claude_parse_collects_not_found(machine):
+    path = hz.find(machine["claude"]).path
+    rec = {"type": "user", "cwd": str(machine["webapp"]), "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t9", "content": "zsh: command not found: pipx"}]}}
+    with path.open("a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    assert "pipx" in hz.parse(hz.find(machine["claude"])).not_found
+
+
+def test_report_separates_the_sessions_branch(machine):
+    web = Path(machine["webapp"])
+    subprocess.run(["git", "-C", str(web), "branch", "old-work", "main"], check=True)
+    subprocess.run(["git", "-C", str(web), "checkout", "-q", "old-work"], check=True)
+    _commit(web, "old.txt", "old", "old work")
+    subprocess.run(["git", "-C", str(web), "checkout", "-q", "feature/login"], check=True)
+    proc = run_cli(machine, "report", "--session", machine["claude"])
+    assert "1 commit(s) on feature/login (the session's branch)" in proc.stdout
+    assert "1 commit(s) on 1 other local branch(es)" in proc.stdout and "old-work (1)" in proc.stdout
+    assert "--all-branches" in proc.stdout
+
+
+def test_refresh_picks_up_what_the_session_said_after_staging(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    src = hz.find(machine["claude"]).path
+    with src.open("a") as fh:
+        fh.write(json.dumps({"type": "user", "cwd": str(machine["webapp"]), "uuid": "late",
+                             "message": {"role": "user", "content": "one more thing"}}) + "\n")
+    staged = home / ".claude/projects/-root-src-webapp" / f"{world.CLAUDE_ID}.jsonl"
+    assert "one more thing" not in staged.read_text()
+    proc = run_cli(machine, "stage", "--refresh", "--out", str(home.parent))
+    assert proc.returncode == 0, proc.stderr
+    last = json.loads(staged.read_text().splitlines()[-1])
+    assert last["message"]["content"] == "one more thing" and last["cwd"] == "/root/src/webapp"
+    assert (home / "handoff/upgrade-terraform-providers/transcript.jsonl").exists()
+
+    with src.open("a") as fh:  # a credential pasted after staging: refused, nothing written
+        fh.write(json.dumps({"type": "user", "message": {"role": "user", "content": "ghp_" + "a" * 36}}) + "\n")
+    before = staged.read_text()
+    with pytest.raises(SystemExit) as e:
+        stg.refresh_transcripts(home, log=lambda m: None)
+    assert "GitHub token" in str(e.value) and staged.read_text() == before
+
+
+def test_launch_checks_for_a_login_secret_first(machine, tmp_path):
+    out = {"run": None, "url": None, "verdict": "missing_secret", "wanted": ["a-claude-token", "a-claude-session"],
+           "mint_link": "https://mint.example/?name=a-claude-session&project=p&domain=d", "error": "none"}
+    py = _fake_python(tmp_path, "echo '" + json.dumps(out) + "'\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "a", "--project", "p", "--domain", "d",
+                   "--python", str(py))
+    assert proc.returncode == 1
+    assert "Nothing was started" in proc.stderr and "a-claude-token, a-claude-session" in proc.stderr
+    assert "claude setup-token" in proc.stderr and "--project p --domain d" in proc.stderr
+    assert "https://mint.example/" in proc.stderr
+
+
+def test_merge_sweep_keeps_appledouble_names_already_there(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    (src / ".claude").mkdir(parents=True)
+    (src / ".claude/new.txt").write_text("n")
+    (src / "a.txt").write_text("a")
+    (dest / ".claude").mkdir(parents=True)
+    (dest / "._.claude").write_text("theirs")
+    (dest / "._a.txt").write_text("theirs too")  # existed before the copy
+    result = sl.copy_into(src, dest, merge=True)
+    assert (dest / "._.claude").read_text() == "theirs" and (dest / "._a.txt").read_text() == "theirs too"
+    assert result["appledouble_deleted"] == []
+
+
+def test_kubeconfig_files_with_one_name_do_not_collide(machine, tmp_path, monkeypatch):
+    a, b = tmp_path / "dev/config", tmp_path / "prod/config"
+    for f in (a, b):
+        f.parent.mkdir()
+        f.write_text(f"{f.parent.name}\n")
+    monkeypatch.setenv("KUBECONFIG", f"{a}:{b}")
+    creds = [c for c in inv.credentials(Path(machine["home"]))[0] if c.id.startswith("kubeconfig")]
+    assert sorted(c.rel for c in creds) == [".kube/config", ".kube/config-1"]
+    assert len({c.id for c in creds}) == 2
+
+
+def test_refresh_finds_a_sidecar_created_after_staging(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    src = hz.find(machine["claude"]).path
+    late = src.with_suffix("") / "subagents/agent-2.jsonl"
+    late.write_text(json.dumps({"type": "user", "cwd": str(machine["webapp"]), "message": {"content": "late"}}) + "\n")
+    stg.refresh_transcripts(home, log=lambda m: None)
+    staged = home / ".claude/projects/-root-src-webapp" / world.CLAUDE_ID / "subagents/agent-2.jsonl"
+    assert json.loads(staged.read_text())["cwd"] == "/root/src/webapp"

@@ -18,6 +18,16 @@ discarding (see ``FAILED_COPY``).
 Merging never overwrites a file already in the target home: a clash is
 skipped and listed, except ``.agent-sessions/finished.json`` (rows are merged
 by key) and the CLAUDE.md / AGENTS.md handoff section (appended).
+
+Before mounting, the transcripts are copied again from their sources (see
+stage.refresh_transcripts), so a session that kept going since ``stage``
+arrives whole. Files are copied without extended attributes, so macOS writes
+no AppleDouble ``._*`` files into the mount, and any that appear are deleted
+before publishing.
+
+The upload runs as the user: ``flyte`` with their config (``--config``), and
+the object store with their own cloud credentials (``--aws-profile`` sets
+AWS_PROFILE), which need write access to the project's bucket.
 """
 
 from __future__ import annotations
@@ -56,17 +66,21 @@ class SealOptions:
     dry_run: bool = False
     mount_timeout: float = 300.0
     publish_timeout: float = 3600.0
+    config: Optional[str] = None  # flyte config file, passed as `flyte --config`
+    aws_profile: Optional[str] = None  # AWS_PROFILE for the upload
+    refresh: bool = True  # copy the transcripts again just before sealing
     extra_args: list[str] = field(default_factory=list)
 
 
 def command(opts: SealOptions, mnt: Path) -> list[str]:
+    base = [opts.flyte] + (["--config", opts.config] if opts.config else [])
     if opts.merge_artifact:
-        cmd = [opts.flyte, "mount", "volume", str(mnt), "--artifact", opts.merge_artifact,
-               "--fork-name", local_name(opts)]
+        cmd = base + ["mount", "volume", str(mnt), "--artifact", opts.merge_artifact,
+                      "--fork-name", local_name(opts)]
     else:
         if not opts.volume:
             raise SystemExit("a new volume needs --volume <name>")
-        cmd = [opts.flyte, "create", "volume", opts.volume, "--mount", str(mnt)]
+        cmd = base + ["create", "volume", opts.volume, "--mount", str(mnt)]
         if opts.artifact:
             cmd += ["--artifact", opts.artifact]
         if opts.bucket:
@@ -76,6 +90,15 @@ def command(opts: SealOptions, mnt: Path) -> list[str]:
     if opts.domain:
         cmd += ["--domain", opts.domain]
     return cmd + opts.extra_args
+
+
+def command_env(opts: SealOptions) -> dict:
+    """The environment `flyte` runs in: the user's, plus their AWS profile,
+    and COPYFILE_DISABLE so macOS tools write no ``._*`` files."""
+    env = {**os.environ, "COPYFILE_DISABLE": "1"}
+    if opts.aws_profile:
+        env["AWS_PROFILE"] = opts.aws_profile
+    return env
 
 
 def local_name(opts: SealOptions) -> str:
@@ -92,7 +115,8 @@ The mount is still up and nothing has been published yet:
 
 Ctrl-C, `kill` and `flyte unmount volume` all PUBLISH whatever is in the
 mount, so do not stop it that way until it is complete. Either finish it:
-copy the rest of {home} into {mnt}, then
+copy the rest of {home} into {mnt} (on macOS without extended attributes,
+`COPYFILE_DISABLE=1 cp -R -X ...`, and then `find {mnt} -name '._*' -delete`), then
   kill -INT {pid}            # publishes, like Ctrl-C
 or throw it away. SIGKILL is the one stop that does not publish:
   kill -KILL {pid}
@@ -149,12 +173,42 @@ def collisions(home: Path, dest: Path) -> list[str]:
     return hits
 
 
+def _copy_plain(f: Path, out: Path) -> None:
+    """Copy a file's bytes, mode and times, and nothing else: copying
+    extended attributes or flags into a FUSE mount makes macOS write an
+    AppleDouble ``._name`` file beside each one."""
+    shutil.copyfile(f, out)
+    st = f.stat()
+    os.chmod(out, st.st_mode & 0o7777)
+    os.utime(out, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def is_appledouble(name: str) -> bool:
+    return name.startswith("._")
+
+
+def sweep_appledouble(dest: Path, written: list[str]) -> list[str]:
+    """Delete the ``._name`` files macOS left beside the files just written.
+    ``written`` lists only files whose ``._name`` did not exist before the
+    copy, so nothing already in a merged home is touched."""
+    gone = []
+    for rel in written:
+        p = dest / rel
+        ad = p.parent / f"._{p.name}"
+        if os.path.lexists(ad) and not os.path.isdir(ad):
+            os.unlink(ad)
+            gone.append(str(ad.relative_to(dest)))
+    return gone
+
+
 def copy_into(src: Path, dest: Path, merge: bool) -> dict:
     """Copy the staged home into the mounted volume. When merging, nothing in
     the target is overwritten and no write goes through a symlink."""
-    copied, skipped, merged = 0, [], []
+    copied, skipped, merged, written = 0, [], [], []
     for f in sorted(src.rglob("*")):
         rel = f.relative_to(src).as_posix()
+        if is_appledouble(f.name):
+            continue
         out = dest / rel
         _no_symlinks_below(dest, rel)
         if f.is_dir() and not f.is_symlink():
@@ -178,12 +232,15 @@ def copy_into(src: Path, dest: Path, merge: bool) -> dict:
             else:
                 skipped.append(rel)
             continue
+        if not os.path.lexists(out.parent / f"._{out.name}"):
+            written.append(rel)  # any ._name that appears now is macOS's, not the home's
         if f.is_symlink():
             os.symlink(os.readlink(f), out)
         else:
-            shutil.copy2(f, out)
+            _copy_plain(f, out)
         copied += 1
-    return {"copied": copied, "merged": merged, "skipped_existing": skipped}
+    return {"copied": copied, "merged": merged, "skipped_existing": skipped,
+            "appledouble_deleted": sweep_appledouble(dest, written)}
 
 
 def _wait_mounted(proc: subprocess.Popen, mnt: Path, timeout: float) -> None:
@@ -201,28 +258,45 @@ def seal(opts: SealOptions) -> dict:
     home = opts.staged_home
     if not (home / ".handoff" / "manifest.json").is_file():
         raise SystemExit(f"{home} is not a staged handoff home (no .handoff/manifest.json)")
+    reserved = stg.reserved_in(home)
+    if reserved:
+        # Checked before anything mounts: writing one fails part way through.
+        raise SystemExit(
+            f"The staged home has {', '.join(reserved)} at its top level, and a Union Volume reserves those"
+            " names (they are read-only virtual entries at its root). Re-stage it with this version of"
+            " `handoff.py stage`, which moves them aside for setup.sh to put back, or move them yourself.")
     mnt = opts.mountpoint or Path(tempfile.mkdtemp(prefix="union-handoff-mnt-"))
     if opts.merge_artifact and not opts.fork_name:
         opts.fork_name = local_name(opts)
     cmd = command(opts, mnt)
     if opts.dry_run:
-        return {"dry_run": True, "command": shlex.join(cmd), "mountpoint": str(mnt), "local_name": local_name(opts)}
+        prefix = f"AWS_PROFILE={shlex.quote(opts.aws_profile)} " if opts.aws_profile else ""
+        return {"dry_run": True, "command": prefix + shlex.join(cmd), "mountpoint": str(mnt),
+                "local_name": local_name(opts)}
     if shutil.which(opts.flyte) is None:
         raise SystemExit(f"`{opts.flyte}` is not on PATH; install flyteplugins-union (pip install flyteplugins-union)")
+    if opts.refresh:
+        stg.refresh_transcripts(home, log=lambda m: print(m, file=sys.stderr))
 
     mnt.mkdir(parents=True, exist_ok=True)
     print(f"$ {shlex.join(cmd)}", file=sys.stderr)
     log = tempfile.NamedTemporaryFile("w+", prefix="union-handoff-flyte-", suffix=".log", delete=False)
     # Its own session: a Ctrl-C in this terminal must not reach the mount,
     # because a mount that receives one publishes whatever it holds.
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                            env=command_env(opts))
     result: dict = {"command": shlex.join(cmd), "mountpoint": str(mnt), "log": log.name}
     try:
         _wait_mounted(proc, mnt, opts.mount_timeout)
     except RuntimeError as e:
         log.seek(0)
         tail = "\n".join(log.read().splitlines()[-25:])
-        raise SystemExit(f"{e}. The end of its output ({log.name}):\n{tail}")
+        hint = ""
+        if any(w in tail for w in ("AccessDenied", "Access Denied", "403", "Forbidden", "ExpiredToken", "NoCredentials")):
+            hint = ("\nThe object store refused your cloud credentials. The upload uses your own, so they need"
+                    " write access to the project's bucket: pick a profile that has it with --aws-profile"
+                    " (and sign in to it, e.g. `aws sso login --profile <name>`).")
+        raise SystemExit(f"{e}. The end of its output ({log.name}):\n{tail}{hint}")
     if opts.merge_artifact:
         hits = collisions(home, mnt)
         if hits:

@@ -69,6 +69,12 @@ Show the user the whole report, in your own words where it helps. It covers:
   remote when it first boots, recreates its worktrees, and checks out the same
   branch. Only what the remote does not have is shipped: commits not pushed
   yet (as a small bundle), staged and unstaged changes, and untracked files.
+  The report counts the unpushed commits on **the session's branch**
+  separately from those on other local branches. By default only the
+  session's branch and branches checked out in its worktrees travel; the
+  others stay behind unless the user asks for `--all-branches` (on `report`
+  and `stage`). Virtualenvs, `node_modules` and build output are never
+  copied, from repos, skills or memory alike.
   A repo with no remote travels as a **git bundle** of its whole history plus
   that uncommitted work. A directory that is not a git repo travels as a
   **full tree**, without `node_modules`, virtualenvs and build output. Offer
@@ -88,16 +94,28 @@ or let them travel in the volume. Pushing keeps the volume small and the
 work safe on the remote; shipping keeps it private until they push it.
 A repo that travels by reference needs **read access to its remote from the
 agent**: copy the GitHub CLI login (step below) or plan to sign in there
-before running the setup script.
+before running the setup script. A remote that uses **SSH**
+(`git@github.com:...`) needs an SSH key in the agent; when no key is copied,
+the setup script switches github.com to HTTPS (`gh auth setup-git` and an
+`insteadOf` rule) so that `gh auth login` in the agent is enough.
 - **Tools** the sessions ran, counted from their shell commands, with how each
   was installed locally (brew, npm, pip/uv, cargo) and the Linux line that
   installs it in the agent. **Binaries are never copied**: a macOS binary does
   not run on Linux. A setup script installs Linux builds on first boot.
+  Checking for a tool is not using it: `command -v x`, `x --version`, and a
+  command the shell reported "not found" (when it is not installed here
+  either) are not counted.
 - **Credentials** found: GitHub CLI, git credential files, SSH keys, cloud CLI
   logins (AWS, Google Cloud, Azure), kubeconfigs, registry and package tokens,
   secret-looking files such as `.env`, `.npmrc` or `id_ed25519` in a repo, and
   the names (never the values) of secret-looking environment variables. The
-  report never prints a credential's value.
+  report never prints a credential's value. A tool pointed elsewhere by its
+  environment variable (`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`,
+  `KUBECONFIG`, `CLOUDSDK_CONFIG`, `GH_CONFIG_DIR`) is read from where that
+  variable points, and lands at the standard path in the agent. A GitHub CLI
+  login whose token lives in the system keyring (the macOS Keychain) is
+  listed as not copyable: copying its file carries no token, so the user
+  runs `gh auth login` in the agent instead.
 - **Credentials inside what would be copied.** A transcript is copied whole,
   so a token the user pasted or a session printed travels with it; the report
   flags each transcript that holds credential-looking values, and the
@@ -159,6 +177,16 @@ python3 scripts/handoff.py stage --out ~/union-handoff/<name> \
   [--memory 2Gi] [--cpu 2]
 ```
 
+`stage` prints the staged size, and warns, listing the largest directories,
+when it is far above the report's estimate: look for something that should
+not travel before sealing.
+
+A Union Volume reserves a few names at its root (`.config`, `.stats`,
+`.accesslog`, `.trash`), so `~/.config` (where `gh` and `gcloud` keep their
+logins) is staged as `~/.handoff/xdg-config/`, and the setup script copies it
+into `$XDG_CONFIG_HOME` or `~/.config` in the agent. `seal` refuses a staged
+home that still has a reserved name at its top level.
+
 Then, before sealing:
 
 1. **Write the summaries.** For each session that arrives as a written
@@ -176,17 +204,30 @@ Seal it into a Union Volume with the `flyte` CLI from `flyteplugins-union`
 (`pip install flyteplugins-union`; check `flyte create volume --help`). The
 user needs a Union login (`flyte` config for their org, project and domain).
 
+**The upload uses the user's own cloud credentials**, not Union's: the files
+go straight from this machine to the project's bucket, so the credentials
+need write access to it. If the default AWS profile cannot write there, ask
+which profile can, and pass it with `--aws-profile` (sign in to it first,
+e.g. `aws sso login --profile <name>`). Pass `--config <file>` for a flyte
+config other than the default.
+
 ```bash
 # New agent
 python3 scripts/handoff.py seal --staged ~/union-handoff/<name> \
-  --volume <name> --artifact <name> --project <project> --domain <domain>
+  --volume <name> --artifact <name> --project <project> --domain <domain> \
+  [--config <flyte config>] [--aws-profile <profile>]
 
 ```
 
-Add `--dry-run` first to show the exact `flyte` command. `seal` mounts the
-volume, copies the staged home in, and stops the mount, which seals a new,
-immutable version and prints its locator. Pass `--bucket s3://...` to pick the
-storage instead of the project's default.
+Add `--dry-run` first to show the exact `flyte` command. `seal` copies the
+transcripts again from their sources first, so a session that kept going
+since `stage` (this one, usually) arrives with its whole conversation
+(`--no-refresh` skips that; `stage --refresh --out <dir>` does it on its
+own). Then it mounts the volume, copies the staged home in, and stops the
+mount, which seals a new, immutable version and prints its locator. Files go
+in without extended attributes, so macOS writes no `._*` files into the
+volume. Pass `--bucket s3://...` to pick the storage instead of the
+project's default.
 
 Stopping a mount in any normal way (Ctrl-C, `kill`, `flyte unmount volume`)
 publishes what is in it. So if the copy fails or is interrupted part way,
@@ -197,12 +238,46 @@ mount yourself.
 ## 7. Start the agent
 
 `seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`).
-Do not start any session; they wait in the home, finished.
+Start an agent with it as its home; do not start any session, they wait in
+the home, finished.
 
-In the Union console, open **New agent** and paste the locator into
-**Home volume** (an optional field). The agent boots with the handoff as its
-home. The field takes a locator, not an artifact name, so keep the one `seal`
-printed (it is also in the JSON `seal` writes, under `locator`).
+```bash
+python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name>
+```
+
+This starts Union's agent launcher, the deployed task
+`agent-workspace-launcher.launch_agent_workspace`, with `identifier` and
+`home_locator`, through the flyte Python SDK (it uses the Python that the
+user's `flyte` CLI runs on; `--python` overrides). `system` / `production`
+is where each organization's launcher lives; pass `--project`, `--domain` or
+`--launcher-task` if the user's org differs, and `--config` for a flyte
+config other than the default. Add `--dry-run` to see what would be
+launched. Use a new name for `--identifier`: that creates the agent. It
+prints the agent's run, which stays running while the agent is on.
+
+**The agent runs on a Claude login stored as a secret** in the project and
+domain the launcher runs in (`--project`/`--domain`). It uses the first of
+these that exists: `<identifier>-claude-token`, `<identifier>-claude-session`,
+then `<user>-claude-token` and `<user>-claude-session`, where `<user>` is the
+launching user's name (their email address before the `@`). `launch` checks
+for them before starting anything, and when none exists it stops and says
+how to create one:
+
+- a long-lived token (recommended, since several agents can share it): run
+  `claude setup-token`, then
+  `flyte create secret <identifier>-claude-token --project <project> --domain <domain>`
+  and paste the token at the prompt;
+- or, where the organization runs Union's sign-in app, the link `launch`
+  prints, which is that app pre-filled with the secret's name, project and
+  domain: signing in with Claude there stores the session secret.
+
+A session secret can serve only one agent that is on at a time: Union refuses
+a second ("already in use ... turn that one off first"), and nothing is
+disturbed when that happens. Give the agent its own token, then launch again
+with the same identifier.
+
+In the Union console the same is **New agent**, with the locator in the
+optional **Home volume** field.
 
 Then tell the user where to find each session:
 
