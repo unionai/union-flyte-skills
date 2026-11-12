@@ -1101,6 +1101,10 @@ def test_dot_config_is_relocated_and_setup_puts_it_back(machine, tmp_path):
         shutil.copytree(home, agent, symlinks=True)
         if case == "file":
             (agent / ".config").write_text("{}")
+        else:  # an existing file there is never overwritten
+            (agent / ".config/gh").mkdir(parents=True)
+            (agent / ".config/gh/config.yml").write_text("theirs\n")
+            (agent / ".handoff/xdg-config/gh/config.yml").write_text("ours\n")
         script = tmp_path / f"block-{case}.sh"
         script.write_text(block + '\necho "FAILED=$FAILED"\n')
         env = {"HOME": str(agent), "PATH": os.environ["PATH"]}
@@ -1110,6 +1114,9 @@ def test_dot_config_is_relocated_and_setup_puts_it_back(machine, tmp_path):
         assert (where / "gh/hosts.yml").is_file()
         if case == "file":
             assert 'XDG_CONFIG_HOME="$HOME/.xdg-config"' in (agent / ".bashrc").read_text()
+        else:
+            assert (where / "gh/config.yml").read_text() == "theirs\n"
+        assert (agent / ".handoff/xdg-config.done").exists()
 
 
 def test_seal_refuses_reserved_names_before_mounting(machine, tmp_path):
@@ -1121,15 +1128,20 @@ def test_seal_refuses_reserved_names_before_mounting(machine, tmp_path):
         assert ".config" in str(e.value) and "reserves" in str(e.value)
 
 
-def test_copy_skips_and_sweeps_appledouble_files(tmp_path):
+def test_copy_skips_and_sweeps_appledouble_files(tmp_path, monkeypatch):
     src, dest = tmp_path / "src", tmp_path / "dest"
     (src / "d").mkdir(parents=True)
     (src / "d/a.txt").write_text("a")
     (src / "d/a.txt").chmod(0o640)
     (src / "._junk").write_text("x")
     dest.mkdir()
-    (dest / "d").mkdir()
-    (dest / "d/._a.txt").write_text("written by macOS")  # as if the kernel had added it
+    real = sl._copy_plain
+
+    def like_macos(f, out):  # the kernel adds ._name beside a file written into the mount
+        real(f, out)
+        (out.parent / f"._{out.name}").write_text("written by macOS")
+
+    monkeypatch.setattr(sl, "_copy_plain", like_macos)
     result = sl.copy_into(src, dest, merge=False)
     assert (dest / "d/a.txt").read_text() == "a"
     assert oct((dest / "d/a.txt").stat().st_mode & 0o777) == "0o640"
@@ -1276,3 +1288,37 @@ def test_launch_checks_for_a_login_secret_first(machine, tmp_path):
     assert "Nothing was started" in proc.stderr and "a-claude-token, a-claude-session" in proc.stderr
     assert "claude setup-token" in proc.stderr and "--project p --domain d" in proc.stderr
     assert "https://mint.example/" in proc.stderr
+
+
+def test_merge_sweep_keeps_appledouble_names_already_there(tmp_path):
+    src, dest = tmp_path / "src", tmp_path / "dest"
+    (src / ".claude").mkdir(parents=True)
+    (src / ".claude/new.txt").write_text("n")
+    (src / "a.txt").write_text("a")
+    (dest / ".claude").mkdir(parents=True)
+    (dest / "._.claude").write_text("theirs")
+    (dest / "._a.txt").write_text("theirs too")  # existed before the copy
+    result = sl.copy_into(src, dest, merge=True)
+    assert (dest / "._.claude").read_text() == "theirs" and (dest / "._a.txt").read_text() == "theirs too"
+    assert result["appledouble_deleted"] == []
+
+
+def test_kubeconfig_files_with_one_name_do_not_collide(machine, tmp_path, monkeypatch):
+    a, b = tmp_path / "dev/config", tmp_path / "prod/config"
+    for f in (a, b):
+        f.parent.mkdir()
+        f.write_text(f"{f.parent.name}\n")
+    monkeypatch.setenv("KUBECONFIG", f"{a}:{b}")
+    creds = [c for c in inv.credentials(Path(machine["home"]))[0] if c.id.startswith("kubeconfig")]
+    assert sorted(c.rel for c in creds) == [".kube/config", ".kube/config-1"]
+    assert len({c.id for c in creds}) == 2
+
+
+def test_refresh_finds_a_sidecar_created_after_staging(machine, tmp_path):
+    home, _ = stage_all(machine, tmp_path, "claude")
+    src = hz.find(machine["claude"]).path
+    late = src.with_suffix("") / "subagents/agent-2.jsonl"
+    late.write_text(json.dumps({"type": "user", "cwd": str(machine["webapp"]), "message": {"content": "late"}}) + "\n")
+    stg.refresh_transcripts(home, log=lambda m: None)
+    staged = home / ".claude/projects/-root-src-webapp" / world.CLAUDE_ID / "subagents/agent-2.jsonl"
+    assert json.loads(staged.read_text())["cwd"] == "/root/src/webapp"

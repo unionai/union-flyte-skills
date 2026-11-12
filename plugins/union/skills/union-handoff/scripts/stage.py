@@ -496,6 +496,13 @@ apt_install() {
 brew_install() {
   if have brew; then brew install "$@"; else echo "no Homebrew here; install $* by hand" >&2; fi
 }
+copy_missing() {  # copy_missing <from> <to>: copies what <to> lacks, never overwrites
+  (cd "$1" && find . \( -type f -o -type l \) -print) | while IFS= read -r f; do
+    if [ ! -e "$2/$f" ] && [ ! -L "$2/$f" ]; then
+      mkdir -p "$2/$(dirname "$f")" && cp -pP "$1/$f" "$2/$f" || exit 1
+    fi
+  done
+}
 FAILED=""
 need() {  # need <binary> <install command...>
   local bin="$1"; shift
@@ -522,18 +529,20 @@ if have apt-get && [ "$(id -u)" = 0 ]; then apt-get update -qq || true; fi
 
 XDG_CONFIG_BLOCK = """# ~/.config travelled as ~/.handoff/xdg-config: a Union Volume reserves the
 # name .config at its root. Put it where this machine's tools look for it.
-if [ -d "$HOME/.handoff/xdg-config" ] && [ ! -e "$HOME/.handoff/xdg-config.done" ]; then
+if [ -d "$HOME/.handoff/xdg-config" ]; then
   cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
   if [ -e "$cfg" ] && [ ! -d "$cfg" ]; then
     cfg="$HOME/.xdg-config"
     grep -qs 'XDG_CONFIG_HOME=' "$HOME/.bashrc" || echo 'export XDG_CONFIG_HOME="$HOME/.xdg-config"' >> "$HOME/.bashrc"
-    export XDG_CONFIG_HOME="$cfg"
     echo "~/.config is not a directory here; using $cfg (XDG_CONFIG_HOME, exported in ~/.bashrc)"
   fi
-  if mkdir -p "$cfg" && cp -Rn "$HOME/.handoff/xdg-config/." "$cfg/"; then
-    touch "$HOME/.handoff/xdg-config.done"
-  else
-    FAILED="$FAILED xdg-config"
+  export XDG_CONFIG_HOME="$cfg"  # on every run, so a rerun's gh finds it too
+  if [ ! -e "$HOME/.handoff/xdg-config.done" ]; then
+    if mkdir -p "$cfg" && copy_missing "$HOME/.handoff/xdg-config" "$cfg"; then
+      touch "$HOME/.handoff/xdg-config.done"
+    else
+      FAILED="$FAILED xdg-config"
+    fi
   fi
 fi
 """
@@ -995,11 +1004,11 @@ def relocate_reserved(home: Path) -> dict[str, str]:
         where = RELOCATED_TO.get(name, f".handoff/reserved/{name.lstrip('.')}")
         dest = home / where
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            _copy_missing(home / name, dest)
-            shutil.rmtree(home / name)
-        else:
-            (home / name).rename(dest)
+        if os.path.lexists(dest):
+            # Never reached by a fresh stage (its --out is empty); refuse
+            # rather than mix two copies or drop a picked credential.
+            raise SystemExit(f"cannot move ~/{name} aside: {dest} already exists")
+        (home / name).rename(dest)
         moved[name] = where
     return moved
 
@@ -1019,7 +1028,11 @@ def refresh_transcripts(home: Path, log: Callable[[str], None] = print) -> list[
         src = Path(entry.get("source_path") or "")
         if not src.is_file() or src.suffix == ".db" or not entry.get("files"):
             continue  # gone, a database, or staged before this was recorded
-        s = hz.Session(entry["harness"], entry["id"], src, None, extra=[Path(e) for e in entry.get("extra", [])])
+        extra = [Path(e) for e in entry.get("extra", [])]
+        sidecar = src.with_suffix("")  # a Claude sidecar may have appeared since staging
+        if entry["harness"] == "claude" and sidecar.is_dir() and sidecar not in extra:
+            extra.append(sidecar)
+        s = hz.Session(entry["harness"], entry["id"], src, None, extra=extra)
         todo.append((entry, s))
     if not manifest.get("allow_transcript_secrets"):
         found = {s.key: transcript_secrets(s) for _, s in todo}
@@ -1054,6 +1067,13 @@ def refresh_transcripts(home: Path, log: Callable[[str], None] = print) -> list[
             with tmp.open("w") as fh:
                 fh.writelines(hz.iter_text_lines(s.path))
             os.replace(tmp, first)
+            for extra in s.extra:  # sub-agent transcripts, as stage copied them
+                target = first.parent / "extra" / extra.name
+                if extra.is_dir():
+                    shutil.copytree(extra, target, symlinks=True, dirs_exist_ok=True)
+                elif extra.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(extra, target)
         else:
             continue
         done.append(entry["name"])

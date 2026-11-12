@@ -188,7 +188,9 @@ def is_appledouble(name: str) -> bool:
 
 
 def sweep_appledouble(dest: Path, written: list[str]) -> list[str]:
-    """Delete the ``._name`` files macOS left beside what was written."""
+    """Delete the ``._name`` files macOS left beside the files just written.
+    ``written`` lists only files whose ``._name`` did not exist before the
+    copy, so nothing already in a merged home is touched."""
     gone = []
     for rel in written:
         p = dest / rel
@@ -213,7 +215,6 @@ def copy_into(src: Path, dest: Path, merge: bool) -> dict:
             if out.is_symlink():
                 raise Collision(f"{out} is a symlink in the target home; refusing to write through it")
             out.mkdir(parents=True, exist_ok=True)
-            written.append(rel)
             continue
         if merge and os.path.lexists(out):
             if out.is_symlink():
@@ -231,11 +232,12 @@ def copy_into(src: Path, dest: Path, merge: bool) -> dict:
             else:
                 skipped.append(rel)
             continue
+        if not os.path.lexists(out.parent / f"._{out.name}"):
+            written.append(rel)  # any ._name that appears now is macOS's, not the home's
         if f.is_symlink():
             os.symlink(os.readlink(f), out)
         else:
             _copy_plain(f, out)
-        written.append(rel)
         copied += 1
     return {"copied": copied, "merged": merged, "skipped_existing": skipped,
             "appledouble_deleted": sweep_appledouble(dest, written)}

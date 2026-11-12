@@ -890,9 +890,11 @@ def credentials(home: Path, repos: Iterable[Repo] = (), env: Optional[dict] = No
                 found.append(Credential("kubeconfig", "Kubernetes contexts (from $KUBECONFIG)", str(kp), ".kube/config",
                                         "copying gives the agent your cluster access; prefer a scoped kubeconfig secret"))
             else:
-                found.append(Credential(f"kubeconfig:{kp.name}", "Kubernetes contexts (from $KUBECONFIG)", str(kp),
-                                        f".kube/{kp.name}", "prefer a scoped kubeconfig secret; the agent's KUBECONFIG"
-                                        " must list this file too"))
+                # Numbered, so two files with the same name (dev/config,
+                # prod/config) never land on one path.
+                found.append(Credential(f"kubeconfig:{i}", "Kubernetes contexts (from $KUBECONFIG)", str(kp),
+                                        f".kube/config-{i}", "prefer a scoped kubeconfig secret; the agent's KUBECONFIG"
+                                        f" must list ~/.kube/config-{i} too"))
     for cid, kind, rel in AGENT_LOGINS:
         p = home / rel
         if p.exists():
