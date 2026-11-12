@@ -19,7 +19,6 @@ python packaging/build.py     # build
 python packaging/verify.py    # what CI runs
 ```
 
-**Not published.** Nothing in this repo publishes to PyPI or creates a release
-yet. When that is decided, the publish workflow from
-flyteorg/flyte-agent-plugins (trusted publishing on a `v*` tag, gated on
-`verify.py`) is the model to copy.
+**Publishing** is `.github/workflows/publish.yml`: trusted publishing to PyPI
+on a `v*` tag, gated on `verify.py`, with a manual dry run. The steps, and the
+one-time PyPI and GitHub setup, are in [`RELEASING.md`](../RELEASING.md).
