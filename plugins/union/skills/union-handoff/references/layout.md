@@ -110,9 +110,11 @@ One `need <binary> <install line>` per tool the sessions ran that the agent
 image may lack. A tool already present is skipped, so running it twice is
 harmless. Lines the script could not work out are left as `TODO` comments.
 It first takes ownership of the copied repos (files sealed on another machine
-keep its user id, and git refuses a repo owned by someone else), puts back
-`~/.config` (above), and, when a repo's remote uses SSH and no SSH key was
-copied, switches github.com to HTTPS (`gh config set git_protocol https`,
-`gh auth setup-git`, and an `insteadOf` rule for `git@github.com:`) before
-re-cloning the repos. It only writes `~/.handoff/setup.done` once every tool
+keep its user id, and git refuses a repo owned by someone else) and puts back
+`~/.config` (above). Before re-cloning the repos it signs in to GitHub when a
+re-cloned repo is on github.com or the sessions used `gh` (with no login yet,
+`gh auth login --web` prints a one-time code and a link, then waits), runs
+`gh auth setup-git`, and, when a repo's remote uses SSH and no SSH key was
+copied, switches github.com to HTTPS (`gh config set git_protocol https` and
+an `insteadOf` rule for `git@github.com:`). It only writes `~/.handoff/setup.done` once every tool
 it lists is on the PATH.

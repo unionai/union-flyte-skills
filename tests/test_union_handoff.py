@@ -1016,7 +1016,22 @@ def test_launch_uses_the_python_api(machine, tmp_path):
     payload = json.loads(Path(str(py) + ".payload").read_text())
     assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": None,
                        "domain": None, "identifier": "my-agent",
-                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_login": True}
+                       "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_login": True,
+                       "prompt": __import__("handoff").SETUP_PROMPT}
+    assert "watch its chat" not in real.stderr and "takes no first message" in real.stderr  # fake sent none
+
+
+def test_launch_first_message(machine, tmp_path):
+    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\n'
+                      'echo \'{"run": "r1", "url": "u", "verdict": "on", "error": "", "prompt_sent": true}\'\n')
+    base = ["launch", "--locator", "l", "--identifier", "a", "--python", str(py)]
+    proc = run_cli(machine, *base)
+    assert "setup.sh" in json.loads(Path(str(py) + ".payload").read_text())["prompt"]
+    assert "GitHub sign-in code" in proc.stderr
+    run_cli(machine, *base, "--prompt", "hello")
+    assert json.loads(Path(str(py) + ".payload").read_text())["prompt"] == "hello"
+    run_cli(machine, *base, "--no-prompt")
+    assert json.loads(Path(str(py) + ".payload").read_text())["prompt"] is None
 
 
 def test_launch_snippet_is_valid_python():
@@ -1184,7 +1199,29 @@ def test_ssh_remote_with_a_key_copied_keeps_ssh(machine, tmp_path):
     key.parent.mkdir()
     key.write_text("not a real key\n")
     home, _ = stage_all(machine, tmp_path, "claude", ship=False, creds=["ssh:id_ed25519"])
-    assert "gh auth setup-git" not in (home / ".handoff/setup.sh").read_text()
+    setup = (home / ".handoff/setup.sh").read_text()
+    assert "insteadOf" not in setup and "git_protocol https" not in setup
+
+
+def test_setup_signs_in_to_github_before_recloning():
+    setup = stg.setup_script([], restore_repos=True, github=True)
+    login = "gh auth login --hostname github.com --git-protocol https --web --skip-ssh-key </dev/null"
+    assert login in setup and "! gh auth status" in setup
+    assert setup.index(login) < setup.index("gh auth setup-git") < setup.index("restore_repos.py")
+    assert "insteadOf" not in setup  # HTTPS remotes need no rewrite
+    assert "gh auth login" not in stg.setup_script([], restore_repos=True)
+    subprocess.run(["bash", "-n"], input=setup, text=True, check=True)
+
+
+def test_setup_signs_in_for_a_github_https_remote(machine, tmp_path):
+    web = Path(machine["webapp"])
+    subprocess.run(["git", "-C", str(web), "remote", "set-url", "origin", "https://github.com/example/webapp.git"],
+                   check=True)
+    gc = Path(machine["home"]) / ".gitconfig"
+    gc.write_text(gc.read_text() + f'[url "{Path(machine["github"]).as_uri()}/"]\n\tinsteadOf = https://github.com/example/\n')
+    assert inv.remote_host("https://tok@github.com/example/webapp.git") == "github.com"
+    home, _ = stage_all(machine, tmp_path, "claude", ship=False)
+    assert "gh auth login --hostname github.com" in (home / ".handoff/setup.sh").read_text()
 
 
 def test_credentials_follow_their_environment_variables(machine, tmp_path, monkeypatch):

@@ -93,11 +93,13 @@ explicit go-ahead, run `git push`; uncommitted work needs committing first),
 or let them travel in the volume. Pushing keeps the volume small and the
 work safe on the remote; shipping keeps it private until they push it.
 A repo that travels by reference needs **read access to its remote from the
-agent**: copy the GitHub CLI login (step below) or plan to sign in there
-before running the setup script. A remote that uses **SSH**
-(`git@github.com:...`) needs an SSH key in the agent; when no key is copied,
-the setup script switches github.com to HTTPS (`gh auth setup-git` and an
-`insteadOf` rule) so that `gh auth login` in the agent is enough.
+agent**. For github.com (and whenever the sessions used `gh`), the setup
+script signs in with the GitHub CLI before re-cloning: with no login yet, it
+prints a one-time code and a link and waits until the user enters the code
+there. Copying the GitHub CLI login (step below) skips that. A remote that
+uses **SSH** (`git@github.com:...`) needs an SSH key in the agent; when no
+key is copied, the setup script reaches github.com over HTTPS instead
+(`gh auth setup-git` and an `insteadOf` rule).
 - **Tools** the sessions ran, counted from their shell commands, with how each
   was installed locally (brew, npm, pip/uv, cargo) and the Linux line that
   installs it in the agent. **Binaries are never copied**: a macOS binary does
@@ -260,6 +262,12 @@ nothing. Add `--dry-run` to see what would be launched. Use a new name for
 `--identifier`: that creates the agent. It prints the agent's run, which
 stays running while the agent is on.
 
+The agent's lead opens with a first message asking it to run the setup
+script and to pass on any GitHub sign-in code it prints, so tell the user to
+watch the agent's chat for that code. `--prompt` replaces the message and
+`--no-prompt` sends none; if the launcher takes no first message, `launch`
+says so, and the user asks the agent to run `bash ~/.handoff/setup.sh`.
+
 **The agent runs on a Claude login stored as a secret** in the project and
 domain the agent runs in (above). It uses the first of
 these that exists: `<identifier>-claude-token`, `<identifier>-claude-session`,
@@ -291,11 +299,13 @@ Then tell the user where to find each session:
   left off, in its repo under `src/`.
 - **Written handoffs** are in `~/handoff/<session>/` inside the agent. Start a
   new session and ask it to read `~/handoff/<session>/HANDOFF.md` first.
-- On first boot, run `bash ~/.handoff/setup.sh` once, **before restarting any
-  session** (the home's `CLAUDE.md` or `AGENTS.md` tells the agent to). It
-  re-clones the repos that travelled by reference and reapplies their local
-  work, then installs the tools. A clone that fails usually means the agent
-  is not signed in to the git host yet: sign in and run it again.
+- On first boot the lead runs `bash ~/.handoff/setup.sh` (its first message,
+  above), **before any session is restarted**; the home's `CLAUDE.md` or
+  `AGENTS.md` says the same. It signs in to GitHub where needed, re-clones the
+  repos that travelled by reference and reapplies their local work, then
+  installs the tools. Running it again is harmless. A clone that still fails
+  usually means the agent cannot reach a git host other than GitHub: sign in
+  there and run it again.
 - Credentials that were not copied need a fresh sign-in inside the agent.
 
 What lands where in the agent's home, and why, is in

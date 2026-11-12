@@ -160,6 +160,15 @@ def ssh_host(url: Optional[str]) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+def remote_host(url: Optional[str]) -> Optional[str]:
+    """The host of an SSH or http(s) remote, or None."""
+    host = ssh_host(url)
+    if host or not url:
+        return host
+    m = re.match(r"^https?://(?:[^@/]+@)?([^:/]+)", url, re.I)
+    return m.group(1).lower() if m else None
+
+
 def _git(repo: Path, *args: str, check: bool = False) -> str:
     # surrogateescape: repo paths and filenames need not be UTF-8.
     proc = subprocess.run(["git", "-C", str(repo), *args], text=True, errors="surrogateescape", capture_output=True)

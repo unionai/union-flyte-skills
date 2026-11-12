@@ -497,7 +497,7 @@ brew_install() {
   if have brew; then brew install "$@"; else echo "no Homebrew here; install $* by hand" >&2; fi
 }
 copy_missing() {  # copy_missing <from> <to>: copies what <to> lacks, never overwrites
-  (cd "$1" && find . \( -type f -o -type l \) -print) | while IFS= read -r f; do
+  (cd "$1" && find . \\( -type f -o -type l \\) -print) | while IFS= read -r f; do
     if [ ! -e "$2/$f" ] && [ ! -L "$2/$f" ]; then
       mkdir -p "$2/$(dirname "$f")" && cp -pP "$1/$f" "$2/$f" || exit 1
     fi
@@ -548,37 +548,56 @@ fi
 """
 
 
-def _ssh_https_block(hosts: list[str]) -> list[str]:
-    """Reach SSH remotes over HTTPS, for an agent that has no SSH key."""
-    lines = ["# These repos' remotes use SSH and no SSH key was copied, so reach them over",
-             "# HTTPS instead, signed in with the GitHub CLI."]
-    if hosts.count("github.com"):
+def _github_block(ssh: bool) -> list[str]:
+    """Sign in to GitHub before the repos are re-cloned, and, when their remotes
+    use SSH but no SSH key was copied, reach them over HTTPS instead."""
+    lines = ["# Sign in to GitHub with the GitHub CLI before re-cloning. With no login yet it",
+             "# prints a one-time code and a link, then waits until the code is entered there."]
+    if ssh:
+        lines += ["# These repos' remotes use SSH and no SSH key was copied, so they are reached",
+                  "# over HTTPS instead."]
+    lines += [
+        "need gh 'apt_install gh'",
+        "if have gh && ! gh auth status >/dev/null 2>&1; then",
+        '  echo "Signing in to GitHub: open the link below and enter the one-time code." >&2',
+        "  gh auth login --hostname github.com --git-protocol https --web --skip-ssh-key </dev/null || true",
+        "fi",
+    ]
+    if ssh:
+        lines.append("gh config set git_protocol https 2>/dev/null || true")
+    lines += [
+        "if have gh && gh auth status >/dev/null 2>&1; then",
+        "  gh auth setup-git",
+        "else",
+        '  echo "gh is not signed in: run gh auth login, then run this script again" >&2',
+        '  FAILED="$FAILED gh-login"',
+        "fi",
+    ]
+    if ssh:
         lines += [
-            "need gh 'apt_install gh'",
-            "gh config set git_protocol https 2>/dev/null || true",
-            "if gh auth status >/dev/null 2>&1; then",
-            "  gh auth setup-git",
-            "else",
-            '  echo "gh is not signed in: run gh auth login, then run this script again" >&2',
-            '  FAILED="$FAILED gh-login"',
-            "fi",
             "for from in git@github.com: ssh://git@github.com/; do",
             '  git config --global --get-all url.https://github.com/.insteadOf | grep -qxF "$from" \\',
             '    || git config --global --add url.https://github.com/.insteadOf "$from"',
             "done",
         ]
-    for h in sorted(set(hosts) - {"github.com"}):
-        lines.append(f'echo "{h}: its repos use SSH and no SSH key was copied; sign in to {h} over HTTPS or add a key" >&2')
     return lines + [""]
 
 
+def _ssh_hosts_block(hosts: list[str]) -> list[str]:
+    """SSH remotes on hosts other than GitHub, for an agent that has no SSH key."""
+    return [f'echo "{h}: its repos use SSH and no SSH key was copied; sign in to {h} over HTTPS or add a key" >&2'
+            for h in sorted(set(hosts)) if h != "github.com"]
+
+
 def setup_script(tools: list[inv.Tool], restore_repos: bool = False, xdg_config: bool = False,
-                 ssh_hosts: tuple = ()) -> str:
+                 ssh_hosts: tuple = (), github: bool = False) -> str:
     lines = [SETUP_HEADER]
     if xdg_config:
         lines.append(XDG_CONFIG_BLOCK)
-    if ssh_hosts:
-        lines += _ssh_https_block(list(ssh_hosts))
+    github_ssh = any(h == "github.com" for h in ssh_hosts)
+    if github or github_ssh:
+        lines += _github_block(ssh=github_ssh)
+    lines += _ssh_hosts_block(list(ssh_hosts))
     if restore_repos:
         lines += [
             "# Re-clone the repos that travelled by reference and reapply their",
@@ -911,8 +930,13 @@ def stage(sessions: list[hz.Session], opts: StageOptions) -> dict:
     ssh_key_copied = any(c.startswith("ssh:") for c in copied_creds)
     ssh_hosts = sorted({h for r in repos.values() if r.get("mode") == "reference"
                         for h in [inv.ssh_host(r.get("clone_url"))] if h}) if not ssh_key_copied else []
+    # Sign in to GitHub when the sessions used gh, or a re-cloned repo needs it
+    # (HTTPS, or SSH with no key copied).
+    github = any(t.name == "gh" for t in tools_all) or any(
+        inv.remote_host(r.get("clone_url")) == "github.com" and not (ssh_key_copied and inv.ssh_host(r.get("clone_url")))
+        for r in repos.values() if r.get("mode") == "reference")
     (hdir / "setup.sh").write_text(setup_script(tools_all, restore_repos=restores, xdg_config=".config" in relocated,
-                                                ssh_hosts=tuple(ssh_hosts)))
+                                                ssh_hosts=tuple(ssh_hosts), github=github))
     (hdir / "setup.sh").chmod(0o755)
 
     now = time.time()

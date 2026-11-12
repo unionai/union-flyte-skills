@@ -414,11 +414,22 @@ if a["check_login"] and have is not None and not have & set(wanted):
     sys.exit(0)
 try:
     task = r.Task.get(a["task"], project=a["project"], domain=a["domain"], auto_version="latest")
-    task.fetch()  # get() is lazy: fail here, not inside flyte.run
+    task = task.fetch()  # get() is lazy: fail here, not inside flyte.run
 except Exception as e:
     print(json.dumps({"run": None, "url": None, "verdict": "no_launcher", "error": str(e).splitlines()[0] if str(e) else type(e).__name__, **where}))
     sys.exit(0)
-run = flyte.run(task, identifier=a["identifier"], home_locator=a["locator"])
+# The lead's first message. The launcher takes it as conversation=Prompt(text);
+# Prompt is a model guessed from the deployed interface, and the run converts
+# it with that same (cached) interface, so take the class from there.
+kw, prompt_sent = {}, False
+if a["prompt"]:
+    import typing
+    conv = task.interface.inputs.get("conversation")
+    variants = [v for v in typing.get_args(conv[0]) if getattr(v, "__name__", "") == "Prompt"] if conv else []
+    if variants:
+        kw["conversation"], prompt_sent = variants[0](text=a["prompt"]), True
+run = flyte.run(task, identifier=a["identifier"], home_locator=a["locator"], **kw)
+where["prompt_sent"] = prompt_sent
 # The launcher admits or refuses the agent (a login already in use, an
 # agent already on) early in its run; wait that long for the verdict. A run
 # still going after that is the agent, on.
@@ -452,10 +463,21 @@ def flyte_python(flyte_cli: str) -> str:
     return sys.executable
 
 
+# The agent's first message: finish the setup the handoff could not do from here.
+SETUP_PROMPT = (
+    "Your home was just handed off from another machine; ~/.handoff/README.md says what came over and how. "
+    "Finish setting it up: run `bash ~/.handoff/setup.sh` in the background so you can read its output while it"
+    " runs. If it prints a GitHub one-time code and a link, show me both right away so I can sign in, then wait"
+    " for it to finish. When it is done, tell me what it reported, including anything still missing, and list"
+    " the sessions that came over (they wait under Done, and Restart resumes each one)."
+)
+
+
 def launch_command(args) -> list[str]:
     payload = {"task": args.launcher_task, "project": args.project, "domain": args.domain,
                "identifier": args.identifier, "locator": args.locator, "config": args.config,
-               "wait": args.wait, "check_login": not args.skip_login_check}
+               "wait": args.wait, "check_login": not args.skip_login_check,
+               "prompt": None if args.no_prompt else args.prompt}
     return [args.python or flyte_python(args.flyte), "-c", LAUNCH_SNIPPET, json.dumps(payload)]
 
 
@@ -560,6 +582,11 @@ def cmd_launch(args) -> int:
         return 1
     print(f"Agent {args.identifier!r} is starting (run {result['run']}). Its sessions wait under Done; "
           "Restart resumes each one.", file=sys.stderr)
+    if result.get("prompt_sent"):
+        print("Its lead opens by running the setup script; watch its chat for a GitHub sign-in code.", file=sys.stderr)
+    elif not args.no_prompt:
+        print("This launcher takes no first message: in the agent's chat, ask it to run"
+              " `bash ~/.handoff/setup.sh` (it may print a GitHub sign-in code).", file=sys.stderr)
     return 0
 
 
@@ -637,6 +664,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flyte", default="flyte", help="the flyte CLI whose Python to use")
     p.add_argument("--python", help="a Python with flyte-sdk installed (default: the flyte CLI's)")
     p.add_argument("--wait", type=int, default=180, help="seconds to wait for Union to admit or refuse it (default: 180)")
+    p.add_argument("--prompt", default=SETUP_PROMPT,
+                   help="the agent's first message (default: run ~/.handoff/setup.sh, relaying any GitHub sign-in code)")
+    p.add_argument("--no-prompt", action="store_true", help="start the agent with no first message")
     p.add_argument("--skip-secret-check", action="store_true", dest="skip_login_check",
                    help="launch even if no Claude login secret is found for the agent")
     p.add_argument("--dry-run", action="store_true", help="say what would be launched, launch nothing")
