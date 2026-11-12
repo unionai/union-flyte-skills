@@ -19,10 +19,11 @@
                   [--bucket URI] [--project P --domain D] [--config FILE] [--aws-profile NAME] [--dry-run]
       Copy the staged home into a new (or forked) Union Volume and seal it.
 
-  handoff.py launch --locator LOC --identifier NAME [--project system --domain production]
+  handoff.py launch (--staged DIR | --locator LOC) --identifier NAME [--project P --domain D]
                     [--launcher-task agent-workspace-launcher.launch_agent_workspace] [--dry-run]
       Start a Union agent with the sealed volume as its home (sessions not
-      started), through the flyte Python SDK.
+      started), through the flyte Python SDK, in the volume's project and
+      domain unless told otherwise.
 
 Standard library only (Python 3.9+). Reads never write; stage writes only
 under --out; seal writes only into the volume it mounts.
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -343,8 +345,16 @@ def cmd_seal(args) -> int:
         refresh=not args.no_refresh,
     )
     result = sl.seal(opts)
+    if not args.dry_run and result.get("locator"):
+        # For `launch --staged`: the agent runs where its home was sealed.
+        # Outside home/, so it is not part of the volume.
+        (staged / SEALED_FILE).write_text(json.dumps(
+            {"locator": result["locator"], "project": args.project, "domain": args.domain}, indent=1) + "\n")
     print(json.dumps(result, indent=1))
     return 0
+
+
+SEALED_FILE = "sealed.json"
 
 
 # Union's agent launcher, deployed in each organization that runs agents.
@@ -362,6 +372,14 @@ if a["config"]:
     flyte.init_from_config(a["config"], project=a["project"], domain=a["domain"])
 else:
     flyte.init_from_config(project=a["project"], domain=a["domain"])
+# Unset: the flyte config's own defaults, as `seal` used.
+try:
+    a["project"], a["domain"] = flyte.current_project(), flyte.current_domain()
+except Exception:
+    print(json.dumps({"run": None, "url": None, "verdict": "no_project", "project": a["project"], "domain": a["domain"],
+                      "error": "no project and domain given, and the flyte config sets none"}))
+    sys.exit(0)
+where = {"project": a["project"], "domain": a["domain"]}
 # The launcher runs the agent on the first of these secrets that exists in
 # its own project and domain: the agent's long-lived token, its session, then
 # the same two of the person launching it. Check before starting anything.
@@ -392,9 +410,14 @@ if a["check_secret"] and have is not None and not have & set(wanted):
     except Exception:
         pass
     print(json.dumps({"run": None, "url": None, "verdict": "missing_secret", "wanted": wanted, "mint_link": link,
-                      "error": "none of " + ", ".join(wanted) + " exists in " + a["project"] + "/" + a["domain"]}))
+                      "error": "none of " + ", ".join(wanted) + " exists in " + a["project"] + "/" + a["domain"], **where}))
     sys.exit(0)
-task = r.Task.get(a["task"], project=a["project"], domain=a["domain"], auto_version="latest")
+try:
+    task = r.Task.get(a["task"], project=a["project"], domain=a["domain"], auto_version="latest")
+    task.fetch()  # get() is lazy: fail here, not inside flyte.run
+except Exception as e:
+    print(json.dumps({"run": None, "url": None, "verdict": "no_launcher", "error": str(e).splitlines()[0] if str(e) else type(e).__name__, **where}))
+    sys.exit(0)
 run = flyte.run(task, identifier=a["identifier"], home_locator=a["locator"])
 # The launcher admits or refuses the agent (a login already in use, an
 # agent already on) early in its run; wait that long for the verdict. A run
@@ -410,7 +433,7 @@ while time.time() < deadline:
         error = details.pb2.error_info.message if details.pb2.HasField("error_info") else f"phase {phase}"
         break
     time.sleep(10)
-print(json.dumps({"run": run.name, "url": run.url, "verdict": verdict, "error": error}))
+print(json.dumps({"run": run.name, "url": run.url, "verdict": verdict, "error": error, **where}))
 """
 
 
@@ -436,19 +459,49 @@ def launch_command(args) -> list[str]:
     return [args.python or flyte_python(args.flyte), "-c", LAUNCH_SNIPPET, json.dumps(payload)]
 
 
-def missing_secret_help(args, result: dict) -> str:
+def missing_secret_help(args, result: dict, started: bool = False) -> str:
     """What to do when the agent has no Claude login to run on."""
+    project, domain = result.get("project") or args.project, result.get("domain") or args.domain
     lines = [
-        f"Nothing was started: the agent needs a Claude login, stored as a secret in {args.project}/{args.domain}"
-        " (the project and domain the launcher runs in), and none of these exists there:",
+        ("The agent stopped" if started else "Nothing was started") + ": it needs a Claude login, stored as a secret"
+        f" in {project}/{domain} (the project and domain it runs in), and none of these exists there:",
         "  " + ", ".join(result["wanted"]),
         "Create one, then run this again:",
         f"  - a long-lived token: run `claude setup-token`, then `flyte create secret {args.identifier}-claude-token"
-        f" --project {args.project} --domain {args.domain}` and paste the token at the prompt;",
+        f" --project {project} --domain {domain}` and paste the token at the prompt;",
     ]
     if result.get("mint_link"):
         lines.append(f"  - or sign in with Claude in the browser, which stores the session secret: {result['mint_link']}")
     return "\n".join(lines)
+
+
+# The launcher puts its recovery advice after a blank line; that advice names
+# tooling the user does not have, so only the sign-in link in it is kept.
+_MINT_LINK_RE = re.compile(r"Re-mint in your browser\W+(https?://\S+)")
+
+
+def launcher_error(msg: str) -> tuple[str, str | None]:
+    """The launcher's refusal without its own advice, and the sign-in link
+    that advice carried, if any."""
+    m = _MINT_LINK_RE.search(msg)
+    head = msg.split("\n\n", 1)[0]
+    keep = [ln for ln in head.splitlines() if "mint_pod_secret" not in ln and "claude_task/" not in ln]
+    return "\n".join(keep).strip(), (m.group(1) if m else None)
+
+
+def resolve_launch_target(args) -> None:
+    """Fill the locator, project and domain from `seal`'s record in --staged."""
+    sealed = {}
+    if args.staged:
+        f = Path(args.staged).expanduser() / SEALED_FILE
+        if not f.is_file():
+            raise SystemExit(f"{f} not found: seal the staged home first, or pass --locator.")
+        sealed = json.loads(f.read_text())
+    args.locator = args.locator or sealed.get("locator")
+    if not args.locator:
+        raise SystemExit("launch needs --staged (a sealed staging directory) or --locator")
+    if args.project is None and args.domain is None:
+        args.project, args.domain = sealed.get("project"), sealed.get("domain")
 
 
 def cmd_launch(args) -> int:
@@ -458,9 +511,11 @@ def cmd_launch(args) -> int:
     agent that is on is refused by Union: turn it off first."""
     import subprocess
 
+    resolve_launch_target(args)
     cmd = launch_command(args)
     if args.dry_run:
-        print(f"{args.launcher_task} in {args.project}/{args.domain}: identifier={args.identifier} "
+        where = f"{args.project or '<config default>'}/{args.domain or '<config default>'}"
+        print(f"{args.launcher_task} in {where}: identifier={args.identifier} "
               f"home_locator={args.locator} (via {cmd[0]})")
         return 0
     proc = subprocess.run(cmd, text=True, capture_output=True)
@@ -474,16 +529,34 @@ def cmd_launch(args) -> int:
         return proc.returncode
     result = json.loads(proc.stdout.strip().splitlines()[-1])
     print(json.dumps(result))
+    where = f"{result.get('project') or args.project}/{result.get('domain') or args.domain}"
     if result["verdict"] == "missing_secret":
         print(missing_secret_help(args, result), file=sys.stderr)
         return 1
+    if result["verdict"] == "no_project":
+        print("No project and domain to launch in: pass --staged (to use the volume's), or --project and --domain.",
+              file=sys.stderr)
+        return 1
+    if result["verdict"] == "no_launcher":
+        print(f"Union's agent launcher ({args.launcher_task}) is not deployed in {where}: {result['error']}\n"
+              "Pass the --project and --domain it is deployed in (the agent's Claude login secret must be there"
+              " too), or --launcher-task if it has another name.", file=sys.stderr)
+        return 1
     if result["verdict"] == "refused":
-        print(f"Union refused to start {args.identifier!r}: {result['error']}", file=sys.stderr)
-        if "already in use" in result["error"]:
+        error, link = launcher_error(result["error"])
+        if re.search(r"Secret '([^']+)' is missing", error):
+            wanted = re.search(r"Secret '([^']+)' is missing", error).group(1)
+            print(f"Union refused to start {args.identifier!r}: the secret {wanted!r} is missing in {where}.",
+                  file=sys.stderr)
+            print(missing_secret_help(args, {**result, "wanted": [wanted], "mint_link": link}, started=True),
+                  file=sys.stderr)
+            return 1
+        print(f"Union refused to start {args.identifier!r}: {error}", file=sys.stderr)
+        if link:
+            print(f"Sign in with Claude again to renew the agent's login: {link}", file=sys.stderr)
+        if "already in use" in error:
             print("Give this agent a login of its own (see the skill), then launch again with the same identifier.",
                   file=sys.stderr)
-        elif "is missing" in result["error"]:
-            print(missing_secret_help(args, {"wanted": [f"{args.identifier}-claude-token"]}), file=sys.stderr)
         return 1
     print(f"Agent {args.identifier!r} is starting (run {result['run']}). Its sessions wait under Done; "
           "Restart resumes each one.", file=sys.stderr)
@@ -552,12 +625,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="print the flyte command only")
     p.set_defaults(func=cmd_seal)
     p = sub.add_parser("launch", help="start a Union agent with the sealed volume as its home")
-    p.add_argument("--locator", required=True, help="the locator `seal` printed")
+    p.add_argument("--staged", help="the staging directory `seal` sealed: its locator, project and domain")
+    p.add_argument("--locator", help="the locator `seal` printed (instead of --staged)")
     p.add_argument("--identifier", required=True,
                    help="the agent's name: a new one, or an existing agent that is turned off (to give it this home)")
     p.add_argument("--launcher-task", default=LAUNCHER_TASK, help=f"the deployed task that starts agents (default: {LAUNCHER_TASK})")
-    p.add_argument("--project", default="system", help="the project the launcher lives in (default: system)")
-    p.add_argument("--domain", default="production", help="the domain the launcher lives in (default: production)")
+    p.add_argument("--project", help="where the agent runs, which needs the launcher and the agent's Claude login"
+                                    " secret (default: the volume's project with --staged, else the flyte config's)")
+    p.add_argument("--domain", help="as --project (default: the volume's domain with --staged, else the flyte config's)")
     p.add_argument("--config", help="flyte config file (default: flyte's own lookup)")
     p.add_argument("--flyte", default="flyte", help="the flyte CLI whose Python to use")
     p.add_argument("--python", help="a Python with flyte-sdk installed (default: the flyte CLI's)")

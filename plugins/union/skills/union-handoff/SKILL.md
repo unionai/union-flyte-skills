@@ -237,26 +237,31 @@ mount yourself.
 
 ## 7. Start the agent
 
-`seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`).
-Start an agent with it as its home; do not start any session, they wait in
-the home, finished.
+`seal` printed the new version's **locator** (`s3://.../<id>.metadata.json`)
+and recorded it, with the project and domain it sealed into, in
+`<staged>/sealed.json`. Start an agent with it as its home; do not start any
+session, they wait in the home, finished.
 
 ```bash
-python3 scripts/handoff.py launch --locator <locator> --identifier <agent-name>
+python3 scripts/handoff.py launch --staged <staged> --identifier <agent-name>
 ```
 
 This starts Union's agent launcher, the deployed task
 `agent-workspace-launcher.launch_agent_workspace`, with `identifier` and
 `home_locator`, through the flyte Python SDK (it uses the Python that the
-user's `flyte` CLI runs on; `--python` overrides). `system` / `production`
-is where each organization's launcher lives; pass `--project`, `--domain` or
-`--launcher-task` if the user's org differs, and `--config` for a flyte
-config other than the default. Add `--dry-run` to see what would be
-launched. Use a new name for `--identifier`: that creates the agent. It
-prints the agent's run, which stays running while the agent is on.
+user's `flyte` CLI runs on; `--python` overrides). It runs in the volume's
+project and domain (the flyte config's defaults when `seal` was given none);
+`--project` and `--domain` pick another, `--locator` takes a locator directly
+instead of `--staged`, `--launcher-task` names a launcher deployed under
+another name, and `--config` picks a flyte config other than the default.
+That project and domain need both the launcher and the agent's Claude login
+(below); if the launcher is not deployed there, `launch` says so and starts
+nothing. Add `--dry-run` to see what would be launched. Use a new name for
+`--identifier`: that creates the agent. It prints the agent's run, which
+stays running while the agent is on.
 
 **The agent runs on a Claude login stored as a secret** in the project and
-domain the launcher runs in (`--project`/`--domain`). It uses the first of
+domain the agent runs in (above). It uses the first of
 these that exists: `<identifier>-claude-token`, `<identifier>-claude-session`,
 then `<user>-claude-token` and `<user>-claude-session`, where `<user>` is the
 launching user's name (their email address before the `@`). `launch` checks

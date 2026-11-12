@@ -1007,14 +1007,14 @@ def test_launch_uses_the_python_api(machine, tmp_path):
                       'echo \'{"run": "r123", "url": "https://x/r123", "verdict": "on", "error": ""}\'\n')
     args = ["launch", "--locator", "s3://b/v/x.metadata.json", "--identifier", "my-agent", "--python", str(py)]
     dry = run_cli(machine, *args, "--dry-run")
-    assert dry.returncode == 0 and "agent-workspace-launcher.launch_agent_workspace in system/production" in dry.stdout
+    assert dry.returncode == 0 and "launch_agent_workspace in <config default>/<config default>" in dry.stdout
     assert not Path(str(py) + ".payload").exists()
     real = run_cli(machine, *args)
     assert real.returncode == 0, real.stderr
     assert json.loads(real.stdout.strip().splitlines()[-1])["run"] == "r123"
     payload = json.loads(Path(str(py) + ".payload").read_text())
-    assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": "system",
-                       "domain": "production", "identifier": "my-agent",
+    assert payload == {"task": "agent-workspace-launcher.launch_agent_workspace", "project": None,
+                       "domain": None, "identifier": "my-agent",
                        "locator": "s3://b/v/x.metadata.json", "config": None, "wait": 180, "check_secret": True}
 
 
@@ -1289,6 +1289,55 @@ def test_launch_checks_for_a_login_secret_first(machine, tmp_path):
     assert "Nothing was started" in proc.stderr and "a-claude-token, a-claude-session" in proc.stderr
     assert "claude setup-token" in proc.stderr and "--project p --domain d" in proc.stderr
     assert "https://mint.example/" in proc.stderr
+
+
+def test_launch_runs_where_the_volume_was_sealed(machine, tmp_path):
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "sealed.json").write_text(json.dumps({"locator": "s3://b/v/x.metadata.json", "project": "me",
+                                                    "domain": "development"}))
+    py = _fake_python(tmp_path, 'printf "%s" "$3" > "$0.payload"\n'
+                      'echo \'{"run": "r1", "url": "u", "verdict": "on", "error": ""}\'\n')
+    proc = run_cli(machine, "launch", "--staged", str(staged), "--identifier", "a", "--python", str(py))
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(Path(str(py) + ".payload").read_text())
+    assert (payload["locator"], payload["project"], payload["domain"]) == ("s3://b/v/x.metadata.json", "me", "development")
+    # Explicit --project/--domain win over the record.
+    run_cli(machine, "launch", "--staged", str(staged), "--identifier", "a", "--project", "p", "--domain", "d",
+            "--python", str(py))
+    payload = json.loads(Path(str(py) + ".payload").read_text())
+    assert (payload["project"], payload["domain"]) == ("p", "d")
+    none = run_cli(machine, "launch", "--identifier", "a", "--python", str(py))
+    assert none.returncode != 0 and "--staged" in none.stderr
+
+
+def test_launch_rewrites_the_launchers_missing_secret_refusal(machine, tmp_path):
+    msg = ("Secret 'a-claude-session' is missing in this project/domain (pod-admission rejection). The session pod"
+           " never started because Flyte couldn't mount the credentials secret.\n\n"
+           "Re-mint in your browser \u2192 https://mint.example/?name=a-claude-session\n"
+           "(CLI alternative: python claude_task/mint_pod_secret.py --identifier <your-identifier>.)")
+    out = {"run": "r1", "url": "u", "verdict": "refused", "error": msg, "project": "me", "domain": "development"}
+    py = tmp_path / "python"
+    py.write_text("#!/bin/sh\ncat <<'EOF'\n" + json.dumps(out) + "\nEOF\n")
+    py.chmod(0o755)
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "a", "--python", str(py))
+    assert proc.returncode == 1
+    assert "mint_pod_secret" not in proc.stderr.split("}")[-1] and "claude_task" not in proc.stderr.split("}")[-1]
+    assert "'a-claude-session' is missing in me/development" in proc.stderr
+    assert "--project me --domain development" in proc.stderr and "https://mint.example/" in proc.stderr
+
+
+def test_launch_explains_a_project_without_the_launcher(machine, tmp_path):
+    out = {"run": None, "url": None, "verdict": "no_launcher", "error": "task not found", "project": "me",
+           "domain": "development"}
+    py = _fake_python(tmp_path, "echo '" + json.dumps(out) + "'\n")
+    proc = run_cli(machine, "launch", "--locator", "l", "--identifier", "a", "--python", str(py))
+    assert proc.returncode == 1 and "not deployed in me/development" in proc.stderr
+
+
+def test_launcher_error_keeps_the_reason_and_the_link():
+    reason, link = __import__("handoff").launcher_error("boom\n\nRe-mint in your browser -> https://m.x/?a=b\nmore")
+    assert (reason, link) == ("boom", "https://m.x/?a=b")
 
 
 def test_merge_sweep_keeps_appledouble_names_already_there(tmp_path):
